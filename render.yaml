@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: pelagos-backend
+    runtime: python
+    region: oregon
+    plan: free
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: ARGO_BACKEND
+        value: erddap
+      - key: DEFAULT_STRIDE
+        value: "2"
+      - key: REFRESH_HOURS
+        value: "6"
+      - key: ALLOWED_ORIGINS
+        value: "*"
+      - key: CMEMS_USERNAME
+        sync: false
+      - key: CMEMS_PASSWORD
+        sync: false
+      - key: CMEMS_DATASET_ID
+        value: cmems_mod_glo_phy_my_0.083deg_P1D-m

@@ -1,0 +1,1708 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no"/>
+<title>PELAGOS — Immersive Ocean Visualization · SIH-26067</title>
+
+<!-- Runtime configuration for Render/Vercel backend URL -->
+<script src="./config.js"></script>
+
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet"/>
+<link href="https://cdn.jsdelivr.net/npm/cesium@1.119.0/Build/Cesium/Widgets/widgets.css" rel="stylesheet"/>
+
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+  tailwind.config = { theme: { extend: {
+    colors: { abyss:'#040a10', mist:'#d9e7ec', dim:'#8fa6b0', line:'rgba(126,196,207,0.14)', accent:'#56d4e2' },
+    fontFamily: { disp:['"Space Grotesk"','sans-serif'], mono:['"IBM Plex Mono"','monospace'] }
+  }}};
+</script>
+
+<style>
+  html,body{height:100%;margin:0;background:#040a10;overflow:hidden}
+  #root{height:100%}
+  .glass{background:rgba(6,15,23,0.78);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);
+         border:1px solid rgba(126,196,207,0.14);border-radius:8px}
+  ::-webkit-scrollbar{width:8px;height:8px}
+  ::-webkit-scrollbar-thumb{background:rgba(126,196,207,0.18);border-radius:4px}
+  ::-webkit-scrollbar-track{background:transparent}
+  *{scrollbar-width:thin;scrollbar-color:rgba(126,196,207,0.18) transparent}
+  input[type=range].tl-range{-webkit-appearance:none;appearance:none;background:transparent;cursor:pointer}
+  input[type=range].tl-range::-webkit-slider-runnable-track{height:16px;background:transparent}
+  input[type=range].tl-range::-webkit-slider-thumb{-webkit-appearance:none;width:13px;height:13px;border-radius:50%;
+    background:#06121a;border:2px solid #56d4e2;margin-top:1.5px}
+  input[type=range].tl-range::-moz-range-track{height:16px;background:transparent}
+  input[type=range].tl-range::-moz-range-thumb{width:11px;height:11px;border-radius:50%;background:#06121a;border:2px solid #56d4e2}
+  .hatch{background:repeating-linear-gradient(45deg,rgba(226,180,90,0.30) 0 3px,rgba(226,180,90,0.05) 3px 8px)}
+  .boot-bar{animation:bootbar 1.1s ease-in-out infinite}
+  @keyframes bootbar{0%{transform:translateX(-110%)}100%{transform:translateX(440%)}}
+  .cesium-viewer-bottom{display:none!important}
+  canvas{display:block}
+  button{transition:color .18s,border-color .18s,background-color .18s}
+</style>
+</head>
+
+<body class="bg-abyss">
+<div id="root"></div>
+<div id="cesium-credit" style="display:none"></div>
+
+<script>window.CESIUM_BASE_URL='https://cdn.jsdelivr.net/npm/cesium@1.119.0/Build/Cesium/';</script>
+<script src="https://cdn.jsdelivr.net/npm/cesium@1.119.0/Build/Cesium/Cesium.js"></script>
+<script src="https://unpkg.com/three@0.149.0/build/three.min.js"></script>
+<script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
+<script src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone@7.24.7/babel.min.js"></script>
+<script>
+  Babel.registerPreset('tsx', { presets: [[Babel.availablePresets['typescript'], { allExtensions: true, isTSX: true }]] });
+</script>
+
+<script type="text/babel" data-presets="tsx,react">
+const { useState, useEffect, useRef, useMemo, useSyncExternalStore } = React;
+
+/* ============================================================================
+ * 1 · UTILITIES
+ * ==========================================================================*/
+const clamp = (v:number, a:number, b:number) => Math.max(a, Math.min(b, v));
+const lerp  = (a:number, b:number, t:number) => a + (b - a) * t;
+const mod   = (a:number, n:number) => ((a % n) + n) % n;
+const pad2  = (n:number) => String(n).padStart(2, '0');
+const isMobile = window.matchMedia('(pointer: coarse)').matches || window.innerWidth < 768;
+
+function hashStr(s:string){ let h = 2166136261 >>> 0;
+  for (let i = 0; i < s.length; i++){ h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
+  return h >>> 0; }
+function mulberry32(seed:number){ let a = seed >>> 0; return () => {
+  a |= 0; a = (a + 0x6D2B79F5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a);
+  t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
+
+const fmtLat = (v:number, d = 2) => `${Math.abs(v).toFixed(d)}°${v >= 0 ? 'N' : 'S'}`;
+const fmtLon = (v:number, d = 2) => `${Math.abs(v).toFixed(d)}°${v >= 0 ? 'E' : 'W'}`;
+const fmtDepth = (d:number) => d >= 1000 ? `${(d/1000).toFixed(d >= 10000 ? 1 : 2)} km` : `${Math.round(d)} m`;
+
+/* ============================================================================
+ * 2 · TYPED DATA CONTRACTS  (the seam where a real API plugs in later)
+ * ==========================================================================*/
+type VariableKey = 'temp' | 'sal' | 'cur' | 'oxy';
+type Provenance  = 'observed' | 'interpolated' | 'modelled' | 'predicted';
+type Selection   = { kind:'float'; id:string } | { kind:'sample'; lat:number; lon:number; depth:number };
+
+interface LatLon { lat:number; lon:number }
+interface SitePhysics extends LatLon {
+  id:string; name:string; region:string; maxDepth:number; blurb:string;
+  ts:number; ss:number; td:number; sd:number; mld:number; tw:number;
+  salMaxAmp:number; salMaxZ:number;
+  flow:number; eddy:number; bgU:number; bgV:number;
+  o2s:number; o2d:number; o2z0:number; o2minAmp:number; o2minZ:number; o2minW:number;
+}
+interface ProfilePoint { depth:number; temperature:number; salinity:number; currentSpeed:number; currentDir:number; oxygen:number }
+interface ProfileResult { zmax:number; points:ProfilePoint[] }
+interface Sample { depth:number; temperature:number; salinity:number; currentSpeed:number; currentDir:number; oxygen:number }
+interface ProvInfo { provenance:Provenance; source:string; label:string }
+interface DataPoint extends Sample { lat:number; lon:number; prov:ProvInfo; timestamp:string }
+interface FloatRecord {
+  id:string; platform:string; lat:number; lon:number; cycle:number;
+  lastReportOffset:number; parkingDepth:number; profile:ProfileResult; source:string;
+}
+interface CurrentVector { u:number; v:number; w:number; speed:number; dirDeg:number }
+
+/* ============================================================================
+ * 3 · PRESENTATION TOKENS (colormaps follow cmocean, Thyng et al. 2016)
+ * ==========================================================================*/
+const CMAPS:Record<VariableKey, {label:string; ref:string; stops:[number,string][]}> = {
+  temp:{ label:'Temperature', ref:'cmocean·thermal', stops:[[0,'#1c0f45'],[0.22,'#551d6e'],[0.42,'#a22c6d'],[0.62,'#e04e63'],[0.80,'#f5925a'],[1,'#f6e8a4']] },
+  sal: { label:'Salinity',    ref:'cmocean·haline',  stops:[[0,'#0e1f38'],[0.28,'#1d5087'],[0.52,'#2e93bd'],[0.75,'#7fd0d2'],[1,'#e3f5ef']] },
+  cur: { label:'Current speed', ref:'cmocean·speed', stops:[[0,'#e9f2f6'],[0.25,'#9fbcd3'],[0.50,'#6b83b6'],[0.72,'#7f5ba6'],[0.88,'#c04a70'],[1,'#ef5a54']] },
+  oxy: { label:'Dissolved O₂', ref:'cmocean·oxy',    stops:[[0,'#f2e4dc'],[0.25,'#c9a7cd'],[0.50,'#7b8abc'],[0.75,'#39679a'],[1,'#132b45']] },
+};
+const VAR_COLORS:Record<VariableKey,string> = { temp:'#f2a15f', sal:'#7fd0d2', cur:'#a9c0d6', oxy:'#c9a7cd' };
+const FIELD:Record<VariableKey,'temperature'|'salinity'|'currentSpeed'|'oxygen'> =
+  { temp:'temperature', sal:'salinity', cur:'currentSpeed', oxy:'oxygen' };
+const VARIABLES:{key:VariableKey; label:string; unit:string; icon:string; digits:number}[] = [
+  { key:'temp', label:'TEMP',    unit:'°C',       icon:'Thermometer', digits:2 },
+  { key:'sal',  label:'SAL',     unit:'PSU',      icon:'Droplets',    digits:2 },
+  { key:'cur',  label:'CURRENT', unit:'m/s',      icon:'Waves',       digits:2 },
+  { key:'oxy',  label:'O₂',      unit:'µmol/kg',  icon:'Wind',        digits:1 },
+];
+const PROV:Record<Provenance, {label:string; color:string; dashed?:boolean}> = {
+  observed:     { label:'Observed',     color:'#56d4e2' },
+  interpolated: { label:'Interpolated', color:'#9db0ba', dashed:true },
+  modelled:     { label:'Modelled',     color:'#8fb0c9' },
+  predicted:    { label:'Predicted',    color:'#e2b45a' },
+};
+const PROV_SRC:Record<Provenance,string> = { observed:'in-situ (Argo)', interpolated:'analysis L4', modelled:'reanalysis', predicted:'forecast' };
+
+function hex2rgb(h:string):[number,number,number]{ return [parseInt(h.slice(1,3),16), parseInt(h.slice(3,5),16), parseInt(h.slice(5,7),16)]; }
+function sampleStops(stops:[number,string][], t:number):[number,number,number]{
+  t = clamp(t, 0, 1);
+  for (let i = 1; i < stops.length; i++){
+    if (t <= stops[i][0]){
+      const f = (t - stops[i-1][0]) / Math.max(1e-6, stops[i][0] - stops[i-1][0]);
+      const a = hex2rgb(stops[i-1][1]), b = hex2rgb(stops[i][1]);
+      return [lerp(a[0],b[0],f), lerp(a[1],b[1],f), lerp(a[2],b[2],f)];
+    }
+  }
+  return hex2rgb(stops[stops.length-1][1]);
+}
+function buildLUT(stops:[number,string][]) { const lut = new Float32Array(256*3);
+  for (let i = 0; i < 256; i++){ const c = sampleStops(stops, i/255); lut[i*3] = c[0]/255; lut[i*3+1] = c[1]/255; lut[i*3+2] = c[2]/255; }
+  return lut; }
+const cssGradient = (stops:[number,string][]) =>
+  `linear-gradient(90deg, ${stops.map(([p,c]) => `${c} ${Math.round(p*100)}%`).join(', ')})`;
+
+/* ============================================================================
+ * 4 · DATA SERVICE — synthetic but physically-structured.
+ *     Swap this object for a fetch-backed implementation; nothing else changes.
+ * ==========================================================================*/
+const REF_MS = Date.UTC(2025, 2, 21, 6, 0, 0);
+const provFor = (t:number):ProvInfo =>
+  t < -2 ? { provenance:'modelled',     label:'Reanalysis', source:'INDOMOD reanalysis · INCOIS/MoES — assimilates Argo profiles & altimetry' }
+: t <= 2 ? { provenance:'interpolated', label:'Analysis',   source:'L4 blended analysis · multi-mission altimetry + in-situ gridding (0.25°)' }
+:         { provenance:'predicted',     label:'Forecast',   source:'NCUM-O coupled forecast · 48 h horizon · 0.25° grid' };
+const timeISO = (t:number) => new Date(REF_MS + t*3600000).toISOString().slice(0,19) + 'Z';
+const timeUTC = (t:number) => { const d = new Date(REF_MS + t*3600000);
+  return `${d.getUTCFullYear()}-${pad2(d.getUTCMonth()+1)}-${pad2(d.getUTCDate())} ${pad2(d.getUTCHours())}:${pad2(d.getUTCMinutes())} UTC`; };
+
+  /* ============================================================================
+ * 4b · LIVE DATA SERVICE — fetches real data from the backend
+ * ==========================================================================*/
+const resolveApiBase = (): string => {
+  const cfg = (window as any).__PELAGOS_CONFIG__;
+  if (cfg && cfg.API_BASE) {
+    return String(cfg.API_BASE).replace(/\/+$/, '');
+  }
+  try {
+    const q = new URLSearchParams(window.location.search).get('api');
+    if (q) return q.replace(/\/+$/, '');
+  } catch (e) {}
+  if (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') {
+    return 'http://localhost:8000/api';
+  }
+  return `${window.location.origin}/api`;
+};
+const API_BASE = resolveApiBase();
+
+const DataService = {
+  online: false,
+
+  async ping(){ try { const r = await fetch(`${API_BASE}/health`);
+      this.online = r.ok; } catch(e){ this.online = false; } return this.online; },
+
+  async briefing(lat:number, lon:number){
+    try { const r = await fetch(`${API_BASE}/briefing?lat=${lat}&lon=${lon}`);
+      if (!r.ok) throw new Error('http ' + r.status);
+      return await r.json();
+    } catch(e){ return null; } },
+
+  /* Fit the site's physics formulas to REAL data, then swap in REAL floats */
+  async enrich(site:SitePhysics):Promise<SitePhysics> {
+    const b = await this.briefing(site.lat, site.lon);
+    if (!b){ this.online = false; return site; }
+    this.online = true;
+    const patch:any = { _rev: Date.now(), _briefing: b };
+    const srcs:string[] = [];
+
+    // 1) calibrate T/S formulas using the real Argo profile
+    if (b.argo_profile?.pressure_dbar?.length){
+      const P:number[]=[], T:number[]=[], S:number[]=[];
+      for (let i=0; i<b.argo_profile.pressure_dbar.length; i++){
+        const p=b.argo_profile.pressure_dbar[i], t=b.argo_profile.temperature_c[i],
+              s=b.argo_profile.salinity_psu[i];
+        if (isFinite(p)&&isFinite(t)&&isFinite(s)&&p>2&&p<1900){ P.push(p);T.push(t);S.push(s); }
+      }
+      if (P.length >= 6){
+        const ts=T[0], td=T[T.length-1];
+        if (isFinite(ts)&&isFinite(td)&&ts-td>0.4){
+          let best={z0:80,tw:40,err:Infinity};
+          const sse=(z0:number,tw:number)=>{let e=0;
+            for(let i=0;i<P.length;i++){const m=td+(ts-td)/(1+Math.exp((P[i]-z0)/tw));
+              e+=(m-T[i])*(m-T[i]);} return e;};
+          for(let z0=20;z0<=420;z0+=20)for(let tw=15;tw<=160;tw+=5){
+            const e=sse(z0,tw); if(e<best.err)best={z0,tw,err:e};}
+          patch.ts=ts; patch.td=td; patch.mld=Math.max(8,best.z0-55); patch.tw=best.tw;
+        }
+        const ss=S[0], sd=S[S.length-1];
+        if (isFinite(ss)&&isFinite(sd)){ patch.ss=ss; patch.sd=sd; }
+        srcs.push('T/S profile: ' + (b.argo_profile.source||'Argo GDAC'));
+      }
+    }
+
+    // 2) surface values from the model grid
+    const g = b.grid || {};
+    if (g.current_u?.value!=null && g.current_v?.value!=null){
+      patch.bgU=g.current_u.value; patch.bgV=g.current_v.value;
+      patch.flow=Math.max(0.08, Math.hypot(patch.bgU,patch.bgV)*1.4);
+      srcs.push('surface fields: ' + (g.current_u.demo ? 'demo model' : 'Copernicus Marine'));
+    }
+    if (g.temperature?.value!=null && patch.ts==null) patch.ts=g.temperature.value;
+
+    if (b.waves?.wave_height_m?.length) srcs.push('waves: ' + (b.waves.source||'wave model'));
+    srcs.push('O2: parametric model');
+    patch._sources = srcs.join(' · ');
+
+    // 3) replace fake floats with REAL Argo float positions
+    Ocean.invalidateCaches();
+    const merged = { ...site, ...patch };
+    const recs:FloatRecord[] = (b.floats||[]).map((f:any)=>{
+      let hrs=-48; try{ hrs=-Math.min(500,Math.max(1,(Date.now()-Date.parse(f.time))/3600000)); }catch(e){}
+      return { id:String(f.platform), platform:'Argo float · WMO '+f.platform,
+        lat:f.lat, lon:f.lon, cycle:f.profiles??1, lastReportOffset:hrs,
+        parkingDepth:1000, profile:Ocean.profileAt(merged,f.lat,f.lon,hrs),
+        source:'Argo GDAC · live fetch', _real:true } as any as FloatRecord;
+    });
+    Ocean.setFloats(site.id, recs);
+
+    return merged;
+  },
+
+  /* Fetch the REAL observed profile when a real float is clicked */
+  async floatProfile(f:FloatRecord, site:SitePhysics){
+    try {
+      const r = await fetch(`${API_BASE}/argo/profile?lat=${f.lat.toFixed(2)}&lon=${f.lon.toFixed(2)}`);
+      if (!r.ok) throw new Error('http');
+      const j = await r.json();
+      const off = Ocean.latLonToOffset(site, f.lat, f.lon);
+      const pts:ProfilePoint[] = [];
+      const P=j.pressure_dbar, T=j.temperature_c, S=j.salinity_psu;
+      const step = Math.max(1, Math.floor(P.length/45));
+      for (let i=0;i<P.length;i+=step){
+        if (!isFinite(P[i])||!isFinite(T[i])) continue;
+        const v = Ocean.vectorAt(site, off.x, off.y, P[i], 0);
+        pts.push({ depth:P[i], temperature:T[i], salinity:isFinite(S[i])?S[i]:34.7,
+                   currentSpeed:v.speed, currentDir:v.dirDeg, oxygen:Ocean.oxyAt(site,P[i]) });
+      }
+      if (pts.length<4) return;
+      f.profile = { zmax:Math.min(2000,Math.max(...P)), points:pts };
+      f.parkingDepth = Math.round(Math.max(...P));
+      (f as any)._realProfile = true;
+    } catch(e){ /* keep calibrated profile */ }
+  },
+};
+
+const SITES:SitePhysics[] = [
+  { id:'bob', name:'Bay of Bengal — Fresh Plume', region:'N. Indian Ocean', lat:17.8, lon:88.2, maxDepth:2600,
+    blurb:'Ganga–Brahmaputra runoff caps the bay with a low-salinity lid. The strong halocline traps heat and feeds one of Earth\u2019s most intense oxygen-minimum zones.',
+    ts:29.2, ss:31.6, td:2.8, sd:34.86, mld:28, tw:34, salMaxAmp:0.55, salMaxZ:120,
+    flow:0.45, eddy:190, bgU:0.18, bgV:0.05, o2s:188, o2d:168, o2z0:80, o2minAmp:160, o2minZ:380, o2minW:250 },
+  { id:'eqio', name:'Equatorial Indian Ocean', region:'Indian Ocean', lat:0.5, lon:80.5, maxDepth:4300,
+    blurb:'Wyrtki jets race east along the equator; a shallow thermocline makes this the fastest-responding region of the Indian Ocean to climate modes.',
+    ts:29.3, ss:34.9, td:3.4, sd:34.72, mld:40, tw:45, salMaxAmp:0.12, salMaxZ:150,
+    flow:0.55, eddy:240, bgU:0.32, bgV:0, o2s:182, o2d:170, o2z0:90, o2minAmp:120, o2minZ:520, o2minW:300 },
+  { id:'aras', name:'Arabian Sea — OMZ Core', region:'N. Indian Ocean', lat:16.5, lon:67.5, maxDepth:3700,
+    blurb:'Intense monsoon-driven productivity and poor ventilation produce one of the most severe oxygen-minimum zones in the global ocean.',
+    ts:27.4, ss:36.5, td:2.6, sd:34.8, mld:55, tw:55, salMaxAmp:0, salMaxZ:0,
+    flow:0.40, eddy:220, bgU:0.12, bgV:-0.08, o2s:178, o2d:170, o2z0:70, o2minAmp:176, o2minZ:260, o2minW:220 },
+  { id:'agul', name:'Agulhas Current', region:'SW Indian Ocean', lat:-34.2, lon:26.8, maxDepth:3100,
+    blurb:'The strongest western boundary current of the Indian Ocean, famous for its retroflection eddies that leak warm water into the Atlantic.',
+    ts:22.6, ss:35.5, td:3.6, sd:34.8, mld:65, tw:70, salMaxAmp:0, salMaxZ:0,
+    flow:1.50, eddy:260, bgU:-1.0, bgV:-0.8, o2s:196, o2d:185, o2z0:90, o2minAmp:70, o2minZ:600, o2minW:350 },
+  { id:'guls', name:'Gulf Stream', region:'N. Atlantic', lat:36.4, lon:-73.6, maxDepth:3300,
+    blurb:'A swift, meandering western boundary current transporting warm subtropical water northward and shedding energetic rings.',
+    ts:23.6, ss:36.1, td:3.8, sd:34.94, mld:70, tw:80, salMaxAmp:0, salMaxZ:0,
+    flow:1.30, eddy:280, bgU:0.25, bgV:1.05, o2s:210, o2d:190, o2z0:110, o2minAmp:95, o2minZ:650, o2minW:380 },
+  { id:'kuro', name:'Kuroshio Extension', region:'N.W. Pacific', lat:35.2, lon:145.4, maxDepth:5500,
+    blurb:'Where the Kuroshio frees itself from the coast — a basin-scale eddy nursery and a sharp front between subtropical and subpolar water.',
+    ts:21.8, ss:34.7, td:2.2, sd:34.5, mld:90, tw:95, salMaxAmp:0, salMaxZ:0,
+    flow:1.15, eddy:300, bgU:0.9, bgV:0.2, o2s:220, o2d:160, o2z0:100, o2minAmp:130, o2minZ:800, o2minW:420 },
+  { id:'drak', name:'Drake Passage', region:'Southern Ocean', lat:-58.5, lon:-63.0, maxDepth:3900,
+    blurb:'The Antarctic Circumpolar Current squeezes through the tightest gap in the world ocean — cold, well-ventilated, relentlessly stormy.',
+    ts:3.4, ss:33.9, td:1.2, sd:34.72, mld:120, tw:160, salMaxAmp:0, salMaxZ:0,
+    flow:0.80, eddy:320, bgU:0.55, bgV:0.3, o2s:330, o2d:200, o2z0:150, o2minAmp:35, o2minZ:700, o2minW:500 },
+  { id:'chal', name:'Challenger Deep', region:'Mariana Trench', lat:11.37, lon:142.59, maxDepth:10935,
+    blurb:'The deepest seafloor on Earth. Hadal waters below 6,000 m are near-freezing, near-still, and pressed by more than a thousand atmospheres.',
+    ts:29.1, ss:34.55, td:1.4, sd:34.68, mld:50, tw:60, salMaxAmp:0, salMaxZ:0,
+    flow:0.06, eddy:500, bgU:0.02, bgV:0.015, o2s:195, o2d:152, o2z0:110, o2minAmp:55, o2minZ:750, o2minW:450 },
+  { id:'peru', name:'Peru Upwelling', region:'S.E. Pacific', lat:-12.5, lon:-80.5, maxDepth:3900,
+    blurb:'Trade winds drive cold, nutrient-rich water to the surface — the engine of the Humboldt Current system and the El Niño heartbeat.',
+    ts:18.4, ss:34.95, td:2.4, sd:34.6, mld:25, tw:30, salMaxAmp:0, salMaxZ:0,
+    flow:0.35, eddy:180, bgU:0.25, bgV:0.1, o2s:180, o2d:150, o2z0:60, o2minAmp:165, o2minZ:200, o2minW:180 },
+];
+
+const Ocean = {
+  _rangeMemo: new Map<string,{min:number,max:number}>(),
+  _floatMemo: new Map<string,FloatRecord[]>(),
+  _phaseMemo: new Map<string,number[]>(),
+
+  listSites(){ return SITES; },
+  setFloats(siteId:string, recs:FloatRecord[]){ this._floatMemo.set(siteId, recs); },
+  invalidateCaches(){ this._rangeMemo.clear(); this._floatMemo.clear(); },
+
+  latLonToOffset(site:SitePhysics, lat:number, lon:number){
+    return { x:(lon - site.lon) * 111320 * Math.cos(site.lat * Math.PI/180), y:(lat - site.lat) * 110540 }; },
+  offsetToLatLon(site:SitePhysics, x:number, y:number):LatLon{
+    return { lat: site.lat + y/110540, lon: site.lon + x/(111320 * Math.cos(site.lat * Math.PI/180)) }; },
+
+  siteForPoint(lat:number, lon:number):SitePhysics {
+    let best = SITES[0], bd = 1e9;
+    SITES.forEach(s => { const d = (s.lat-lat)*(s.lat-lat) + (s.lon-lon)*(s.lon-lon); if (d < bd){ bd = d; best = s; } });
+    return { ...best, id:`drop:${lat.toFixed(2)},${lon.toFixed(2)}`, name:'User drop point',
+      region:`${fmtLat(lat)} ${fmtLon(lon)}`,
+      ts: clamp(best.ts + (best.lat - lat) * 0.34, -1.8, 31.5),
+      ss: clamp(best.ss + (lat - best.lat) * 0.012, 30.5, 37.5),
+      flow: best.flow * 0.85, bgU: best.bgU * 0.7, bgV: best.bgV * 0.7,
+      blurb:'User-defined study point — physics inherited from the nearest climatic regime, adjusted for latitude.' }; },
+
+  // — physics —
+  tempAt(site:SitePhysics, z:number, t:number, jit = 0){
+    const f = 1 / (1 + Math.exp((z - (site.mld + 55)) / site.tw));
+    const di = 0.28 * Math.exp(-z/28) * Math.sin(mod(6 + t, 24)/24 * 6.2832 - 2.4);
+    return site.td + (site.ts - site.td) * f + di + jit; },
+  salAt(site:SitePhysics, z:number, jit = 0){
+    const b = site.sd + (site.ss - site.sd) * Math.exp(-z/((site as any).salLen || 95));    
+    const sub = site.salMaxAmp > 0 ? site.salMaxAmp * Math.exp(-Math.pow((z - site.salMaxZ)/85, 2)) : 0;
+    return b + sub + jit; },
+  oxyAt(site:SitePhysics, z:number, jit = 0){
+    const s = site.o2d + (site.o2s - site.o2d) * Math.exp(-z/site.o2z0);
+    const omz = site.o2minAmp * Math.exp(-Math.pow((z - site.o2minZ)/site.o2minW, 2));
+    return Math.max(2, s - omz + jit); },
+  _phases(site:SitePhysics){ let m = this._phaseMemo.get(site.id); if (m) return m;
+    const r = mulberry32(hashStr(site.id)); m = [r()*6.28, r()*6.28, r()*6.28, r()*6.28];
+    this._phaseMemo.set(site.id, m); return m; },
+  // divergence-free eddy field from a streamfunction + a mean background flow
+  vectorAt(site:SitePhysics, x:number, y:number, z:number, t:number):CurrentVector {
+    const P = this._phases(site);
+    const kx = 6.2832/site.eddy, ky = 6.2832/(site.eddy*0.72);
+    const A  = site.flow * (0.16 + 0.84*Math.exp(-z/300)) * (site.eddy/6.2832);
+    const w1 = t*0.10 + P[0], w2 = t*0.07 + P[1], w3 = t*0.13 + P[2], w4 = t*0.05 + P[3];
+    const u1 = -A * Math.sin(kx*x + w1) * ky * Math.sin(ky*y + w2);
+    const v1 = -A * Math.cos(ky*y + w2) * kx * Math.cos(kx*x + w1);
+    const u2 = 0.42*A * Math.sin(kx*1.9*x - w3 + P[0]) * ky * 2.3 * Math.cos(ky*2.3*y + w4 + P[1]);
+    const v2 = -0.42*A * kx * 1.9 * Math.cos(kx*1.9*x - w3 + P[0]) * Math.sin(ky*2.3*y + w4 + P[1]);
+    const u = u1 + u2 + site.bgU, v = v1 + v2 + site.bgV;
+    const w = 0.05 * A * Math.sin(kx*1.3*x + ky*0.6*y + t*0.2 + P[2]);
+    return { u, v, w, speed:Math.hypot(u, v), dirDeg: mod(Math.atan2(u, v) * 57.2958, 360) }; },
+  variableAt(site:SitePhysics, x:number, y:number, z:number, t:number, key:VariableKey, jit = 0){
+    if (key === 'cur')  return this.vectorAt(site, x, y, z, t).speed;
+    if (key === 'temp') return this.tempAt(site, z, t, jit*0.6);
+    if (key === 'sal')  return this.salAt(site, z, jit*0.05);
+    return this.oxyAt(site, z, jit*3); },
+
+  profileAt(site:SitePhysics, lat:number, lon:number, t:number):ProfileResult {
+    const o = this.latLonToOffset(site, lat, lon);
+    const zmax = Math.min(2000, site.maxDepth);
+    const mT = 0.35 * Math.sin(o.x*0.0021) * Math.cos(o.y*0.0017);
+    const pts:ProfilePoint[] = [];
+    for (let i = 0; i <= 40; i++){
+      const z = i <= 8 ? i*10 : 80 + (i-8) * (zmax - 80) / 32;
+      const dm = 0.7 + 0.3*Math.exp(-z/300);
+      const v = this.vectorAt(site, o.x, o.y, z, t);
+      pts.push({ depth:z, temperature:this.tempAt(site, z, t) + mT*dm, salinity:this.salAt(site, z),
+                 currentSpeed:v.speed, currentDir:v.dirDeg, oxygen:this.oxyAt(site, z) });
+    }
+    return { zmax, points:pts }; },
+
+  sampleAt(site:SitePhysics, lat:number, lon:number, depth:number, t:number):DataPoint {
+    const pr = this.profileAt(site, lat, lon, t);
+    const p = pr.points.reduce((a,b) => Math.abs(b.depth - depth) < Math.abs(a.depth - depth) ? b : a);
+    const o = this.latLonToOffset(site, lat, lon);
+    return { depth, temperature:p.temperature, salinity:p.salinity, currentSpeed:p.currentSpeed,
+             currentDir:this.vectorAt(site, o.x, o.y, depth, t).dirDeg, oxygen:p.oxygen,
+             lat, lon, prov:provFor(t), timestamp:timeISO(t) }; },
+
+  sampleFromFloat(f:FloatRecord, depth:number):Sample {
+    const pts = f.profile.points; let i = 0;
+    while (i < pts.length - 2 && pts[i+1].depth < depth) i++;
+    const a = pts[i], b = pts[i+1];
+    const L = clamp((depth - a.depth) / Math.max(1e-6, b.depth - a.depth), 0, 1);
+    return { depth, temperature:lerp(a.temperature,b.temperature,L), salinity:lerp(a.salinity,b.salinity,L),
+             currentSpeed:lerp(a.currentSpeed,b.currentSpeed,L), currentDir:a.currentDir,
+             oxygen:lerp(a.oxygen,b.oxygen,L) }; },
+
+  floatsAt(site:SitePhysics):FloatRecord[] {
+    const m = this._floatMemo.get(site.id); if (m) return m;
+    const r = mulberry32(hashStr(site.id) + 13);
+    const park = [26, 85, 1000, 1000, 2000];
+    const out:FloatRecord[] = [];
+    for (let i = 0; i < 5; i++){
+      const lat = site.lat + (r()-0.5)*1.5, lon = site.lon + (r()-0.5)*1.7;
+      const pd = clamp(park[i] + (r()-0.5)*60, 15, site.maxDepth - 15);
+      const last = -(1 + r()*66);
+      out.push({ id:`290${Math.floor(1500 + r()*900)}`, platform:'Argo float · APEX',
+        lat, lon, cycle:Math.floor(70 + r()*140), lastReportOffset:last, parkingDepth:pd,
+        profile:this.profileAt(site, lat, lon, last),
+        source:'Argo GDAC · Coriolis / INCOIS — delayed-mode QC' });
+    }
+    this._floatMemo.set(site.id, out); return out; },
+
+  rangeAt(site:SitePhysics, key:VariableKey):{min:number,max:number} {
+    const k = site.id + ':' + key; const m = this._rangeMemo.get(k); if (m) return m;
+    let min = 1e9, max = -1e9;
+    for (let z = 0; z <= 2000; z += 20){
+      const v = key === 'cur' ? this.vectorAt(site, 0, 0, z, 0).speed
+              : key === 'temp' ? this.tempAt(site, z, 0)
+              : key === 'sal'  ? this.salAt(site, z) : this.oxyAt(site, z);
+      if (v < min) min = v; if (v > max) max = v;
+    }
+    if (key === 'cur'){ min = 0; max = max * 1.08; } else { const p = (max - min) * 0.05; min -= p; max += p; }
+    const r = { min, max }; this._rangeMemo.set(k, r); return r; },
+
+  surfaceStats(site:SitePhysics, t:number){
+    return { sst:this.tempAt(site, 3, t), sss:this.salAt(site, 3), cur:this.vectorAt(site, 0, 0, 6, t) }; },
+
+  interpretNote(s:Sample, depth:number, site:SitePhysics){
+    const notes:string[] = [];
+    const gT = (this.tempAt(site, Math.max(1, depth-25), 0) - this.tempAt(site, depth+25, 0)) / 50;
+    const gS = (this.salAt(site, Math.max(1, depth-25))  - this.salAt(site, depth+25)) / 50;
+    if (depth < site.mld * 1.25)       notes.push('Inside the wind-stirred surface mixed layer — properties nearly uniform with depth.');
+    if (gT > 0.06)                     notes.push('Thermocline — temperature falls rapidly with depth.');
+    if (gS > 0.008)                    notes.push('Halocline — salinity rises sharply with depth (barrier layer).');
+    if (s.oxygen < 20 && depth > 120 && depth < 1300) notes.push('Within the oxygen-minimum zone — near-suboxic waters.');
+    if (s.currentSpeed > 0.8)          notes.push('Swift geostrophic flow — an energetic boundary current.');
+    if (depth > site.maxDepth - 130)   notes.push('Near the seafloor — benthic boundary layer.');
+    if (!notes.length)                 notes.push('Open-ocean interior — weak vertical gradients at this level.');
+    return notes.slice(0, 2).join(' '); },
+};
+
+/* ============================================================================
+ * 5 · STATE (tiny external store + useSyncExternalStore)
+ * ==========================================================================*/
+type Phase = 'boot' | 'globe' | 'diving' | 'underwater' | 'ascending';
+interface AppState {
+  phase:Phase; site:SitePhysics|null; variable:VariableKey; depth:number;
+  timeOffset:number; playing:boolean; selection:Selection|null; toast:{msg:string; id:number}|null;
+}
+let state:AppState = { phase:'boot', site:null, variable:'temp', depth:60, timeOffset:0, playing:false, selection:null, toast:null };
+const subs = new Set<() => void>();
+const store = {
+  get:() => state,
+  set(patch:Partial<AppState>){ state = { ...state, ...patch }; subs.forEach(f => f()); },
+  subscribe(f:() => void){ subs.add(f); return () => { subs.delete(f); }; },
+};
+const useApp = () => useSyncExternalStore(store.subscribe, store.get);
+const toast = (msg:string) => store.set({ toast:{ msg, id:Date.now() + Math.random() } });
+
+const globeRegistry:{ g:GlobeEngine|null } = { g:null };
+const uwRegistry:{ e:UnderwaterEngine|null } = { e:null };
+
+/* ============================================================================
+ * 6 · GLOBE ENGINE (CesiumJS)
+ * ==========================================================================*/
+class GlobeEngine {
+  viewer:any = null;
+  private flying = false; private lastAct = 0;
+  private group:any[] = []; private hover:LatLon|null = null; private lastHover = 0;
+
+  async init(el:HTMLElement, cb:{ onReady:()=>void; onError:(m:string)=>void;
+    onPickPoint:(lat:number, lon:number)=>void; onPickFloat:(id:string)=>void }) {
+    try {
+      if (!(window as any).Cesium) throw new Error('Cesium failed to load — check network');
+      const C:any = (window as any).Cesium;
+      const viewer = this.viewer = new C.Viewer(el, {
+        animation:false, timeline:false, baseLayerPicker:false, geocoder:false, homeButton:false,
+        sceneModePicker:false, navigationHelpButton:false, fullscreenButton:false, infoBox:false,
+        selectionIndicator:false, creditContainer:document.getElementById('cesium-credit'),
+        baseLayer:false, terrainProvider:new C.EllipsoidTerrainProvider(),
+      });
+      const scene = viewer.scene;
+      scene.globe.baseColor = C.Color.fromCssColorString('#0b3a55');
+      scene.skyAtmosphere.show = true;   // limb glow — the sphere must read against black space
+      // Natural Earth II (bundled — no token). If tiles fail, globe still renders on baseColor.
+      try {
+        const tms = await C.TileMapServiceImageryProvider.fromUrl(C.buildModuleUrl('Assets/Textures/NaturalEarthII'));
+        const layer = viewer.imageryLayers.addImageryProvider(tms);
+        layer.brightness = 0.92; layer.saturation = 0.8; layer.contrast = 1.12; layer.gamma = 1.0;
+      } catch (e) { /* graceful fallback: darker globe + graticule, app continues */ }
+      const grid = viewer.imageryLayers.addImageryProvider(new C.GridImageryProvider({
+        cells:6, color:C.Color.fromCssColorString('#7ee0ea').withAlpha(0.2), glowColor:C.Color.TRANSPARENT }));
+      grid.alpha = 0.28;
+      // explicit starting camera — centered on the Indian Ocean, full globe in frame
+      viewer.camera.setView({ destination: C.Cartesian3.fromDegrees(76, 6, 2.0e7) });
+
+      viewer.screenSpaceEventHandler.removeInputAction(C.ScreenSpaceEventType.LEFT_DOUBLE_CLICK);
+      const handler = new C.ScreenSpaceEventHandler(scene.canvas);
+      handler.setInputAction((m:any) => {
+        const now = performance.now(); if (now - this.lastHover < 90) return; this.lastHover = now;
+        const cart = viewer.camera.pickEllipsoid(m.endPosition, scene.globe.ellipsoid);
+        this.hover = cart ? (() => { const cg = C.Cartographic.fromCartesian(cart);
+          return { lat:C.Math.toDegrees(cg.latitude), lon:C.Math.toDegrees(cg.longitude) }; })() : null;
+      }, C.ScreenSpaceEventType.MOUSE_MOVE);
+      handler.setInputAction((m:any) => {
+        const pk = scene.drillPick(m.position, 3);
+        for (let i = 0; i < pk.length; i++){
+          const id = pk[i]?.id?.id;
+          if (typeof id === 'string' && id.startsWith('float:')){ cb.onPickFloat(id.slice(6)); return; }
+        }
+        const cart = viewer.camera.pickEllipsoid(m.position, scene.globe.ellipsoid);
+        if (cart){ const cg = C.Cartographic.fromCartesian(cart);
+          cb.onPickPoint(C.Math.toDegrees(cg.latitude), C.Math.toDegrees(cg.longitude)); }
+      }, C.ScreenSpaceEventType.LEFT_CLICK);
+
+      scene.canvas.addEventListener('pointerdown', () => { this.lastAct = performance.now(); });
+      scene.canvas.addEventListener('wheel', () => { this.lastAct = performance.now(); }, { passive:true });
+      scene.canvas.style.cursor = 'crosshair';
+      scene.preRender.addEventListener(() => {   // gentle idle rotation, never fights the user
+        if (this.flying || performance.now() - this.lastAct < 4000) return;
+        const h = viewer.camera.positionCartographic.height;
+        if (h > 2.5e6) viewer.camera.rotate(C.Cartesian3.UNIT_Z, -0.0004);
+      });
+      this.lastAct = performance.now();
+      cb.onReady();
+    } catch (e:any){ cb.onError(String(e?.message || 'WebGL initialization failed').toUpperCase()); }
+  }
+
+  getHover(){ return this.hover; }
+  private clearGroup(){ this.group.forEach(e => this.viewer.entities.remove(e)); this.group = []; }
+  clearSite(){ if (this.viewer) this.clearGroup(); }
+
+  showSite(site:SitePhysics){
+    const C:any = (window as any).Cesium; if (!this.viewer) return;
+    this.clearGroup();
+    this.group.push(this.viewer.entities.add({
+      id:'site', position:C.Cartesian3.fromDegrees(site.lon, site.lat),
+      ellipse:{ semiMajorAxis:90000, semiMinorAxis:90000, height:0,
+        material:C.Color.fromCssColorString('#56d4e2').withAlpha(0.06),
+        outline:true, outlineColor:C.Color.fromCssColorString('#56d4e2').withAlpha(0.4), outlineWidth:1.5 },
+      point:{ pixelSize:8, color:C.Color.fromCssColorString('#041018'),
+        outlineColor:C.Color.fromCssColorString('#56d4e2'), outlineWidth:2.5,
+        heightReference:C.HeightReference.CLAMP_TO_GROUND },
+      label:{ text:site.name, font:'600 13px "Space Grotesk", sans-serif',
+        fillColor:C.Color.fromCssColorString('#d9e7ec'),
+        showBackground:true, backgroundColor:C.Color.fromCssColorString('rgba(4,10,16,0.85)'),
+        backgroundPadding:new C.Cartesian2(8,5), pixelOffset:new C.Cartesian2(0,-20),
+        verticalOrigin:C.VerticalOrigin.BOTTOM,
+        distanceDisplayCondition:new C.DistanceDisplayCondition(0, 2.2e7) },
+    }));
+    Ocean.floatsAt(site).forEach(f => {
+      this.group.push(this.viewer.entities.add({
+        id:'float:' + f.id, position:C.Cartesian3.fromDegrees(f.lon, f.lat),
+        point:{ pixelSize:6, color:C.Color.fromCssColorString('#56d4e2').withAlpha(0.95),
+          outlineColor:C.Color.fromCssColorString('#041018'), outlineWidth:1.5,
+          heightReference:C.HeightReference.CLAMP_TO_GROUND },
+        label:{ text:f.id, font:'500 11px "IBM Plex Mono", monospace',
+          fillColor:C.Color.fromCssColorString('#9fd4de'), pixelOffset:new C.Cartesian2(0,-12),
+          verticalOrigin:C.VerticalOrigin.BOTTOM,
+          distanceDisplayCondition:new C.DistanceDisplayCondition(0, 4.5e6) },
+      }));
+    });
+  }
+
+  flyToSite(site:SitePhysics){
+    const C:any = (window as any).Cesium; if (!this.viewer) return;
+    this.flying = true;
+    this.viewer.camera.flyToBoundingSphere(
+      new C.BoundingSphere(C.Cartesian3.fromDegrees(site.lon, site.lat, 0), 220000),
+      { offset:new C.HeadingPitchRange(0, C.Math.toRadians(-42), 1.25e6), duration:2.0,
+        complete:() => { this.flying = false; }, cancel:() => { this.flying = false; } });
+  }
+
+  resetView(){
+    if (!this.viewer) return; this.flying = true;
+    this.viewer.camera.flyHome(1.6); setTimeout(() => { this.flying = false; }, 1700);
+  }
+
+  // staged descent: approach → pitch-over → surface contact
+  diveTo(site:SitePhysics, onDone:() => void){
+    const C:any = (window as any).Cesium; const v = this.viewer; this.flying = true;
+    const dest = (h:number, pitch:number) => ({
+      destination:C.Cartesian3.fromDegrees(site.lon, site.lat, h),
+      orientation:{ heading:0, pitch:C.Math.toRadians(pitch), roll:0 } });
+    v.camera.flyTo({ ...dest(300000, -38), duration:1.5, easingFunction:C.EasingFunction.QUADRATIC_IN_OUT,
+      complete:() => v.camera.flyTo({ ...dest(6000, -88), duration:2.1, easingFunction:C.EasingFunction.QUADRATIC_IN_OUT,
+        complete:() => v.camera.flyTo({ ...dest(140, -89.9), duration:1.6, easingFunction:C.EasingFunction.QUADRATIC_IN_OUT,
+          complete:() => { this.flying = false; onDone(); }, cancel:() => { this.flying = false; onDone(); } }),
+        cancel:() => { this.flying = false; onDone(); } }),
+      cancel:() => { this.flying = false; onDone(); } });
+  }
+
+  ascendFrom(site:SitePhysics){
+    const C:any = (window as any).Cesium; const v = this.viewer; this.flying = true;
+    v.camera.setView({ destination:C.Cartesian3.fromDegrees(site.lon, site.lat, 420),
+      orientation:{ heading:0, pitch:C.Math.toRadians(-72), roll:0 } });
+    v.camera.flyToBoundingSphere(new C.BoundingSphere(C.Cartesian3.fromDegrees(site.lon, site.lat, 0), 1.5e6),
+      { offset:new C.HeadingPitchRange(0, C.Math.toRadians(-48), 6.5e6), duration:2.6,
+        easingFunction:C.EasingFunction.QUADRATIC_OUT,
+        complete:() => { this.flying = false; }, cancel:() => { this.flying = false; } });
+  }
+
+  setPaused(p:boolean){ if (this.viewer) this.viewer.useDefaultRenderLoop = !p; }
+  destroy(){ try { this.viewer?.destroy(); } catch(e){} this.viewer = null; }
+}
+
+/* ============================================================================
+ * 7 · UNDERWATER ENGINE (Three.js) — particles, trails, floats, light, floor
+ * ==========================================================================*/
+function softDotTexture(){ const c = document.createElement('canvas'); c.width = c.height = 64;
+  const x = c.getContext('2d')!;
+  const g = x.createRadialGradient(32,32,0,32,32,30);
+  g.addColorStop(0,'rgba(255,255,255,1)'); g.addColorStop(0.4,'rgba(255,255,255,0.55)'); g.addColorStop(1,'rgba(255,255,255,0)');
+  x.fillStyle = g; x.fillRect(0,0,64,64); return new (window as any).THREE.CanvasTexture(c); }
+
+class UnderwaterEngine {
+  private renderer:any = null; private scene:any = null; private camera:any = null;
+  private container:HTMLElement|null = null; private site:SitePhysics|null = null;
+  private disposed = false; private ro:any = null; private raf = 0;
+  private params = { depth:60, variable:'temp' as VariableKey, timeOffset:0 };
+  private sDepth = 8; private yaw = 0; private pitch = -0.05; private tYaw = 0; private tPitch = -0.05; private T = 0;
+  private N = 0; private TRAIL = 6; private HALF = 170;
+  private pos!:Float32Array; private trail!:Float32Array; private jit!:Float32Array;
+  private pp!:Float32Array; private pc!:Float32Array;
+  private lp!:Float32Array; private lc!:Float32Array;
+  private lineGeo:any = null; private ptGeo:any = null;
+  private lut:Float32Array = buildLUT(CMAPS.temp.stops);
+  private vrange = { min:0, max:30 };
+  private snowN = 0; private snow!:Float32Array; private snowSp!:Float32Array; private snowGeo:any = null;
+  private shafts:any[] = []; private surface:any = null; private surfBase!:Float32Array;
+  private floorGrp:any = null; private floats:any[] = []; private marker:any = null;
+  private onSelect:(s:Selection) => void = () => {}; private onDepthDelta:(d:number) => void = () => {};
+  private clock:any = null;
+  private drag = false; private moved = 0; private lx = 0; private ly = 0;
+  private ray = new (window as any).THREE.Raycaster();
+  private col:any = null;
+
+  mount(container:HTMLElement, site:SitePhysics, cb:{ onSelect:(s:Selection)=>void; onDepthDelta:(d:number)=>void }){
+    const THREE:any = (window as any).THREE;
+    this.container = container; this.site = site;
+    this.onSelect = cb.onSelect; this.onDepthDelta = cb.onDepthDelta; this.col = new THREE.Color();
+    const w = container.clientWidth || 1, h = container.clientHeight || 1;
+    const r = this.renderer = new THREE.WebGLRenderer({ antialias:true, powerPreference:'high-performance' });
+    r.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2)); r.setSize(w, h);
+    r.domElement.style.touchAction = 'none';
+    container.appendChild(r.domElement);
+    const sc = this.scene = new THREE.Scene();
+    sc.fog = new THREE.FogExp2(0x0d4257, 0.007);
+    const cam = this.camera = new THREE.PerspectiveCamera(66, w/h, 0.5, 9000);
+    cam.rotation.order = 'YXZ'; cam.position.set(0, -this.sDepth, 0);
+    this.clock = new THREE.Clock();
+    this.buildParticles(); this.buildSnow(); this.buildShafts();
+    this.buildSurface(); this.buildFloor(); this.buildFloats(); this.buildMarker();
+    this.rebuildLUT(this.params.variable);
+    this.bindInput(r.domElement);
+    this.ro = new ResizeObserver(() => {
+      const cw = container.clientWidth, ch = container.clientHeight; if (!cw || !ch) return;
+      r.setSize(cw, ch); cam.aspect = cw/ch; cam.updateProjectionMatrix();
+    });
+    this.ro.observe(container);
+    this.loop();
+  }
+
+  private rebuildLUT(key:VariableKey){
+    this.vrange = Ocean.rangeAt(this.site!, key);
+    this.lut = buildLUT(CMAPS[key].stops);
+  }
+
+  /* ---- particle field with comet trails (flow-lines) ---- */
+  private buildParticles(){
+    const THREE:any = (window as any).THREE;
+    this.N = isMobile ? 2600 : 6500;
+    const N = this.N, TR = this.TRAIL, H = this.HALF;
+    this.pos = new Float32Array(N*3); this.trail = new Float32Array(N*TR*3); this.jit = new Float32Array(N);
+    for (let i = 0; i < N; i++){
+      const x = (Math.random()*2-1)*H, y = -Math.random()*320, z = (Math.random()*2-1)*H;
+      this.pos[i*3] = x; this.pos[i*3+1] = y; this.pos[i*3+2] = z;
+      for (let s = 0; s < TR; s++){ this.trail[(i*TR+s)*3] = x; this.trail[(i*TR+s)*3+1] = y; this.trail[(i*TR+s)*3+2] = z; }
+      this.jit[i] = Math.random() - 0.5;
+    }
+    this.lp = new Float32Array(N*TR*2*3); this.lc = new Float32Array(N*TR*2*3);
+    const g = this.lineGeo = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(this.lp, 3).setUsage(THREE.DynamicDrawUsage));
+    g.setAttribute('color',    new THREE.BufferAttribute(this.lc, 3).setUsage(THREE.DynamicDrawUsage));
+    this.scene.add(new THREE.LineSegments(g, new THREE.LineBasicMaterial({
+      vertexColors:true, transparent:true, opacity:0.42, blending:THREE.AdditiveBlending, depthWrite:false })));
+    this.pp = new Float32Array(N*3); this.pc = new Float32Array(N*3);
+    const pg = this.ptGeo = new THREE.BufferGeometry();
+    pg.setAttribute('position', new THREE.BufferAttribute(this.pp, 3).setUsage(THREE.DynamicDrawUsage));
+    pg.setAttribute('color',    new THREE.BufferAttribute(this.pc, 3).setUsage(THREE.DynamicDrawUsage));
+    this.scene.add(new THREE.Points(pg, new THREE.PointsMaterial({
+      size:1.7, map:softDotTexture(), transparent:true, opacity:0.55, vertexColors:true, depthWrite:false, sizeAttenuation:true })));
+  }
+
+  private updateParticles(dt:number){
+    const site = this.site!, TR = this.TRAIL, H = this.HALF, N = this.N;
+    const t = this.params.timeOffset * 0.6 + this.T * 0.05;
+    const camY = -this.sDepth, VIS = 32, dtc = Math.min(dt, 0.05);
+    const { min, max } = this.vrange; const span = Math.max(1e-6, max - min);
+    const key = this.params.variable, lut = this.lut;
+    const pp = this.pp, pc = this.pc, lp = this.lp, lc = this.lc;
+    const pos = this.pos, trail = this.trail, jit = this.jit, dmax = site.maxDepth;
+    for (let i = 0; i < N; i++){
+      const i3 = i*3;
+      let x = pos[i3], y = pos[i3+1], z = pos[i3+2];
+      const d = clamp(-y, 1, dmax - 2);
+      const vec = Ocean.vectorAt(site, x, z, d, t);       // real physics drives the motion
+      let nx = x + vec.u*VIS*dtc, ny = y + vec.w*3*dtc, nz = z + vec.v*VIS*dtc;
+      let wrapped = false;
+      if (nx >  H){ nx -= 2*H; wrapped = true; } else if (nx < -H){ nx += 2*H; wrapped = true; }
+      if (nz >  H){ nz -= 2*H; wrapped = true; } else if (nz < -H){ nz += 2*H; wrapped = true; }
+      const top = camY + H, bot = camY - H;
+      if (ny > top){ ny -= 2*H; wrapped = true; } else if (ny < bot){ ny += 2*H; wrapped = true; }
+      if (ny < -(dmax - 12)){ ny = -(dmax - 12); wrapped = true; }   // never sink through bathymetry
+      pos[i3] = nx; pos[i3+1] = ny; pos[i3+2] = nz;
+      const b = i*TR*3;
+      if (wrapped){ for (let s = 0; s < TR; s++){ trail[b+s*3] = nx; trail[b+s*3+1] = ny; trail[b+s*3+2] = nz; } }
+      else { trail.copyWithin(b, b+3, b + TR*3);
+             trail[b+(TR-1)*3] = nx; trail[b+(TR-1)*3+1] = ny; trail[b+(TR-1)*3+2] = nz; }
+      // color = the active variable sampled at the particle's own depth (you fly through the thermocline)
+      const dd = clamp(-ny, 1, dmax - 2); const j = jit[i];
+      let val:number;
+      if (key === 'cur') val = vec.speed;
+      else if (key === 'temp') val = Ocean.tempAt(site, dd, t, j*0.5);
+      else if (key === 'sal')  val = Ocean.salAt(site, dd, j*0.06);
+      else val = Ocean.oxyAt(site, dd, j*4);
+      let f = (val - min)/span; f = f < 0 ? 0 : f > 1 ? 1 : f;
+      const idx = (f*255)|0, cr = lut[idx*3], cg = lut[idx*3+1], cb = lut[idx*3+2];
+      const dim = 1 - clamp((this.sDepth - 2500)/7000, 0, 1)*0.4;
+      for (let s = 0; s < TR; s++){
+        const o = (i*TR + s)*6, s3 = s*3, s31 = (s+1)*3;
+        lp[o] = trail[b+s3];   lp[o+1] = trail[b+s3+1]; lp[o+2] = trail[b+s3+2];
+        lp[o+3] = trail[b+s31]; lp[o+4] = trail[b+s31+1]; lp[o+5] = trail[b+s31+2];
+        const f0 = (s/TR)*0.30*dim, f1 = ((s+1)/TR)*0.30*dim;
+        lc[o] = cr*f0; lc[o+1] = cg*f0; lc[o+2] = cb*f0;
+        lc[o+3] = cr*f1; lc[o+4] = cg*f1; lc[o+5] = cb*f1;
+      }
+      pp[i3] = nx; pp[i3+1] = ny; pp[i3+2] = nz;
+      pc[i3] = cr*0.62*dim; pc[i3+1] = cg*0.62*dim; pc[i3+2] = cb*0.62*dim;
+    }
+    this.lineGeo.attributes.position.needsUpdate = true;
+    this.lineGeo.attributes.color.needsUpdate = true;
+    this.ptGeo.attributes.position.needsUpdate = true;
+    this.ptGeo.attributes.color.needsUpdate = true;
+  }
+
+  /* ---- marine snow (parallax + stillness cue) ---- */
+  private buildSnow(){
+    const THREE:any = (window as any).THREE;
+    this.snowN = isMobile ? 200 : 550;
+    this.snow = new Float32Array(this.snowN*3); this.snowSp = new Float32Array(this.snowN);
+    for (let i = 0; i < this.snowN; i++){
+      this.snow[i*3] = (Math.random()*2-1)*140; this.snow[i*3+1] = -Math.random()*300;
+      this.snow[i*3+2] = (Math.random()*2-1)*140; this.snowSp[i] = 0.5 + Math.random()*1.6;
+    }
+    const g = this.snowGeo = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(this.snow, 3).setUsage(THREE.DynamicDrawUsage));
+    this.scene.add(new THREE.Points(g, new THREE.PointsMaterial({
+      size:1.15, map:softDotTexture(), color:0xbcd8de, transparent:true, opacity:0.22, depthWrite:false, sizeAttenuation:true })));
+  }
+  private updateSnow(dt:number){
+    const H = 150, camY = -this.sDepth, t = this.T;
+    for (let i = 0; i < this.snowN; i++){
+      const i3 = i*3;
+      let x = this.snow[i3] + Math.sin(t*0.4 + i*1.7)*0.6*dt;
+      let y = this.snow[i3+1] - this.snowSp[i]*dt;
+      let z = this.snow[i3+2];
+      if (y < camY - H){ y = camY + H; x = (Math.random()*2-1)*H; z = (Math.random()*2-1)*H; }
+      this.snow[i3] = x; this.snow[i3+1] = y; this.snow[i3+2] = z;
+    }
+    this.snowGeo.attributes.position.needsUpdate = true;
+  }
+
+  /* ---- sun shafts (surface only, restrained) ---- */
+  private buildShafts(){
+    const THREE:any = (window as any).THREE;
+    const c = document.createElement('canvas'); c.width = 128; c.height = 256;
+    const x = c.getContext('2d')!;
+    const gr = x.createLinearGradient(0,0,0,256);
+    gr.addColorStop(0,'rgba(210,240,250,0.55)'); gr.addColorStop(0.7,'rgba(210,240,250,0.12)'); gr.addColorStop(1,'rgba(210,240,250,0)');
+    x.fillStyle = gr; x.fillRect(0,0,128,256);
+    const tex = new THREE.CanvasTexture(c);
+    for (let i = 0; i < 7; i++){
+      const w = 60 + Math.random()*110, h = 750 + Math.random()*250;
+      const m = new THREE.Mesh(new THREE.PlaneGeometry(w, h), new THREE.MeshBasicMaterial({
+        map:tex, transparent:true, opacity:0.08, blending:THREE.AdditiveBlending,
+        depthWrite:false, side:THREE.DoubleSide, fog:false }));
+      m.position.set((Math.random()*2-1)*260, -h/2 + 40, (Math.random()*2-1)*260);
+      m.rotation.y = Math.random()*Math.PI; m.userData.ph = Math.random()*6.28;
+      this.shafts.push(m); this.scene.add(m);
+    }
+  }
+  private updateShafts(){
+    const so = Math.max(0, 1 - this.sDepth/240);
+    this.shafts.forEach(m => {
+      m.visible = so > 0.015; if (!m.visible) return;
+      m.material.opacity = 0.12*so*(0.65 + 0.35*Math.sin(this.T*0.35 + m.userData.ph));
+      m.rotation.z = Math.sin(this.T*0.1 + m.userData.ph)*0.035;
+    });
+  }
+
+  /* ---- sea surface seen from below ---- */
+  private buildSurface(){
+    const THREE:any = (window as any).THREE;
+    const g = new THREE.PlaneGeometry(2600, 2600, 56, 56); g.rotateX(-Math.PI/2);
+    this.surfBase = (g.attributes.position.array as Float32Array).slice();
+    this.surface = new THREE.Mesh(g, new THREE.MeshBasicMaterial({
+      color:0xaadde8, transparent:true, opacity:0.28, side:THREE.DoubleSide, depthWrite:false }));
+    this.scene.add(this.surface);
+  }
+  private updateSurface(){
+    const v = this.surface.geometry.attributes.position.array as Float32Array, t = this.T;
+    for (let i = 0; i < v.length; i += 3){
+      const x = this.surfBase[i], z = this.surfBase[i+2];
+      v[i+1] = 1.1*Math.sin(x*0.045 + t*0.8) + 0.8*Math.cos(z*0.037 + t*0.56) + 0.4*Math.sin((x+z)*0.02 - t*0.4);
+    }
+    this.surface.geometry.attributes.position.needsUpdate = true;
+  }
+
+  /* ---- bathymetry: you can sit on the seafloor, never fall through it ---- */
+  private buildFloor(){
+    const THREE:any = (window as any).THREE;
+    const g = new THREE.PlaneGeometry(3600, 3600, 72, 72); g.rotateX(-Math.PI/2);
+    const p = g.attributes.position.array as Float32Array;
+    for (let i = 0; i < p.length; i += 3){
+      const x = p[i], z = p[i+2];
+      p[i+1] = 16*Math.sin(x*0.011+1.7)*Math.cos(z*0.009+0.6)
+             + 8*Math.sin(x*0.031+0.4)*Math.sin(z*0.027+2.1)
+             + 3.5*Math.sin(x*0.071 + z*0.063);
+    }
+    const mesh = new THREE.Mesh(g, new THREE.MeshBasicMaterial({ color:0x04141c }));
+    const wire = new THREE.Mesh(g, new THREE.MeshBasicMaterial({ color:0x2a7d8c, wireframe:true, transparent:true, opacity:0.07 }));
+    this.floorGrp = new THREE.Group(); this.floorGrp.add(mesh); this.floorGrp.add(wire);
+    this.floorGrp.position.y = -this.site!.maxDepth;
+    this.scene.add(this.floorGrp);
+  }
+
+  /* ---- Argo floats ---- */
+  private makeFloatTexture(f:FloatRecord, hi:boolean){
+    const c = document.createElement('canvas'); c.width = 320; c.height = 176;
+    const x = c.getContext('2d')!;
+    const ring = hi ? 'rgba(190,245,255,1)' : 'rgba(120,224,238,0.85)';
+    x.strokeStyle = ring; x.lineWidth = 4; x.beginPath(); x.arc(58, 60, 26, 0, 6.2832); x.stroke();
+    x.fillStyle = ring; x.beginPath(); x.arc(58, 60, 7, 0, 6.2832); x.fill();
+    if (hi){ x.strokeStyle = 'rgba(190,245,255,0.4)'; x.lineWidth = 2; x.beginPath(); x.arc(58, 60, 36, 0, 6.2832); x.stroke(); }
+    x.fillStyle = hi ? '#eafcff' : '#c9eef5';
+    x.font = '600 25px "IBM Plex Mono", monospace'; x.fillText(f.id, 104, 52);
+    x.fillStyle = '#8fb4bc'; x.font = '500 19px "IBM Plex Mono", monospace';
+    x.fillText(`${Math.round(f.parkingDepth)} m · cycle ${f.cycle}`, 104, 84);
+    x.fillText('ARGO · OBSERVED', 104, 112);
+    return new (window as any).THREE.CanvasTexture(c);
+  }
+  private buildFloats(){
+    const THREE:any = (window as any).THREE;
+    const site = this.site!;
+    Ocean.floatsAt(site).forEach(f => {
+      const rnd = mulberry32(hashStr(f.id));
+      const ang = rnd()*6.2832, rad = 130 + rnd()*250;
+      const x = Math.cos(ang)*rad, z = Math.sin(ang)*rad;
+      const y = -clamp(f.parkingDepth, 15, site.maxDepth - 15);
+      const matN = new THREE.SpriteMaterial({ map:this.makeFloatTexture(f, false), transparent:true, depthWrite:false });
+      const matH = new THREE.SpriteMaterial({ map:this.makeFloatTexture(f, true),  transparent:true, depthWrite:false });
+      const sp = new THREE.Sprite(matN); sp.position.set(x, y, z); sp.scale.set(40, 22, 1); sp.userData.fid = f.id;
+      const line = new THREE.Line(
+        new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0,-4,0), new THREE.Vector3(0,-26,0)]),
+        new THREE.LineBasicMaterial({ color:0x3f96a5, transparent:true, opacity:0.55 }));
+      line.position.set(x, y-10, z);
+      this.floats.push({ sp, line, rec:f, baseY:y, ph:rnd()*6.28, matN, matH });
+      this.scene.add(sp); this.scene.add(line);
+    });
+  }
+  private updateFloats(){
+    const camY = -this.sDepth;
+    this.floats.forEach(f => {
+      const vis = Math.abs(f.baseY - camY) < 520;
+      f.sp.visible = vis; f.line.visible = vis;
+      if (!vis) return;
+      f.sp.position.y = f.baseY + Math.sin(this.T*0.5 + f.ph)*1.4;
+      f.sp.material.opacity = 0.72 + 0.28*Math.sin(this.T*1.6 + f.ph);
+    });
+  }
+
+  /* ---- sample marker for virtual water probes ---- */
+  private buildMarker(){
+    const THREE:any = (window as any).THREE;
+    const c = document.createElement('canvas'); c.width = c.height = 96;
+    const x = c.getContext('2d')!;
+    x.strokeStyle = '#eafcff'; x.lineWidth = 5;
+    x.beginPath(); x.arc(48, 48, 26, 0, 6.2832); x.stroke();
+    x.lineWidth = 3; x.beginPath();
+    x.moveTo(48,10); x.lineTo(48,26); x.moveTo(48,70); x.lineTo(48,86);
+    x.moveTo(10,48); x.lineTo(26,48); x.moveTo(70,48); x.lineTo(86,48); x.stroke();
+    this.marker = new THREE.Sprite(new THREE.SpriteMaterial({ map:new THREE.CanvasTexture(c), transparent:true, depthWrite:false }));
+    this.marker.scale.set(26, 26, 1); this.marker.visible = false;
+    this.scene.add(this.marker);
+  }
+
+  /* ---- input: drag to look, wheel for depth, click to inspect ---- */
+  private bindInput(el:any){
+    el.addEventListener('pointerdown', (e:PointerEvent) => {
+      this.drag = true; this.moved = 0; this.lx = e.clientX; this.ly = e.clientY;
+      el.setPointerCapture(e.pointerId); });
+    el.addEventListener('pointermove', (e:PointerEvent) => {
+      if (!this.drag) return;
+      const dx = e.clientX - this.lx, dy = e.clientY - this.ly;
+      this.lx = e.clientX; this.ly = e.clientY; this.moved += Math.abs(dx) + Math.abs(dy);
+      this.tYaw -= dx*0.0031; this.tPitch = clamp(this.tPitch - dy*0.0031, -1.35, 1.35); });
+    el.addEventListener('pointerup', (e:PointerEvent) => {
+      if (!this.drag) return; this.drag = false;
+      if (this.moved < 7) this.handleClick(e); });
+    el.addEventListener('pointercancel', () => { this.drag = false; });
+    el.addEventListener('wheel', (e:WheelEvent) => {
+      e.preventDefault();
+      const step = this.sDepth < 150 ? 10 : this.sDepth*0.07;
+      this.onDepthDelta((e.deltaY > 0 ? 1 : -1)*step);
+    }, { passive:false });
+  }
+  private handleClick(e:PointerEvent){
+    const r = this.renderer.domElement.getBoundingClientRect();
+    const nx = ((e.clientX - r.left)/r.width)*2 - 1;
+    const ny = -((e.clientY - r.top)/r.height)*2 + 1;
+    const THREE:any = (window as any).THREE;
+    this.ray.setFromCamera(new THREE.Vector2(nx, ny), this.camera);
+    const hits = this.ray.intersectObjects(this.floats.map(f => f.sp), false);
+    if (hits.length){ this.onSelect({ kind:'float', id:hits[0].object.userData.fid }); return; }
+    const p = this.ray.ray.at(150, new THREE.Vector3());
+    const site = this.site!;
+    const depth = clamp(-p.y, 2, site.maxDepth - 2);
+    const ll = Ocean.offsetToLatLon(site, p.x, p.z);
+    this.onSelect({ kind:'sample', lat:ll.lat, lon:ll.lon, depth });
+  }
+
+  private fogAt(d:number, out:any){
+    const stops:[number,string][] = [[0,'#0d4257'],[180,'#0a3448'],[700,'#07293a'],[2200,'#03121d'],[11000,'#010508']];
+    for (let i = 1; i < stops.length; i++){
+      if (d <= stops[i][0]){
+        const f = (d - stops[i-1][0]) / (stops[i][0] - stops[i-1][0]);
+        out.set(stops[i-1][1]); const b = new out.constructor(stops[i][1]); out.lerp(b, f);
+        return out;
+      }
+    }
+    out.set(stops[stops.length-1][1]); return out;
+  }
+
+  private loop = () => {
+    if (this.disposed) return;
+    this.raf = requestAnimationFrame(this.loop);
+    const dt = Math.min(this.clock.getDelta(), 0.1); this.T += dt;
+    this.sDepth += (this.params.depth - this.sDepth) * Math.min(1, dt*1.9);
+    this.yaw   += (this.tYaw   - this.yaw)   * Math.min(1, dt*9);
+    this.pitch += (this.tPitch - this.pitch) * Math.min(1, dt*9);
+    this.camera.position.set(0, -this.sDepth, 0);
+    this.camera.rotation.set(this.pitch, this.yaw, 0);
+    this.fogAt(this.sDepth, this.col);
+    this.scene.fog.color.copy(this.col);
+    this.scene.fog.density = 0.0085 + clamp(this.sDepth/9000, 0, 1)*0.0035;
+    this.renderer.setClearColor(this.col);
+    this.updateShafts();
+    const surfVisible = this.sDepth < 240;
+    this.surface.visible = surfVisible; if (surfVisible) this.updateSurface();
+    this.floorGrp.visible = this.sDepth > this.site!.maxDepth - 520;
+    this.updateFloats();
+    this.updateParticles(dt);
+    this.updateSnow(dt);
+    if (this.marker.visible) this.marker.material.opacity = 0.75 + 0.25*Math.sin(this.T*3);
+    this.renderer.render(this.scene, this.camera);
+  };
+
+  setParams(p:{ depth:number; variable:VariableKey; timeOffset:number }){
+    const changed = p.variable !== this.params.variable;
+    Object.assign(this.params, p);
+    if (changed) this.rebuildLUT(p.variable);
+  }
+  setSelection(sel:Selection|null){
+    this.floats.forEach(f => {
+      f.sp.material = (sel && sel.kind === 'float' && sel.id === f.rec.id) ? f.matH : f.matN;
+    });
+    if (sel && sel.kind === 'sample' && this.site){
+      const o = Ocean.latLonToOffset(this.site, sel.lat, sel.lon);
+      this.marker.position.set(clamp(o.x, -this.HALF+5, this.HALF-5), -sel.depth, clamp(o.y, -this.HALF+5, this.HALF-5));
+      this.marker.visible = true;
+    } else if (this.marker) this.marker.visible = false;
+  }
+  resetView(){ this.tYaw = 0; this.tPitch = -0.05; }
+  getYaw(){ return this.yaw; }
+  dispose(){
+    this.disposed = true; cancelAnimationFrame(this.raf); this.ro?.disconnect();
+    try { this.scene?.traverse((o:any) => {
+      o.geometry?.dispose?.();
+      const m = o.material;
+      if (m) (Array.isArray(m) ? m : [m]).forEach((mm:any) => { mm.map?.dispose?.(); mm.dispose?.(); });
+    }); } catch(e){}
+    this.renderer?.dispose();
+    const el = this.renderer?.domElement;
+    if (el?.parentNode) el.parentNode.removeChild(el);
+  }
+}
+
+/* ============================================================================
+ * 8 · UI PRIMITIVES
+ * ==========================================================================*/
+const toKebab = (s:string) => s.replace(/([a-z0-9])([A-Z])/g, '$1-$2').toLowerCase();
+const Icon = ({ name, size = 15, className = '', strokeWidth = 1.8 }:
+  { name:string; size?:number; className?:string; strokeWidth?:number }) => {
+  const icons:any = (window as any).lucide?.icons || {};
+  const data = icons[name] || icons[toKebab(name)] || icons[name.toLowerCase()];
+  if (!data) return <span className={'inline-block ' + className} style={{ width:size, height:size }} />;
+  return (
+    <svg className={className} width={size} height={size} viewBox="0 0 24 24" fill="none"
+      stroke="currentColor" strokeWidth={strokeWidth} strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      {data.map((node:any, i:number) => {
+        const attrs:any = {};
+        Object.keys(node[1] || {}).forEach(k => {
+          attrs[k.replace(/-([a-z])/g, (_m:string, c:string) => c.toUpperCase())] = node[1][k]; });
+        return React.createElement(node[0], { ...attrs, key:i });
+      })}
+    </svg>
+  );
+};
+
+const ProvenanceBadge = ({ p, small }:{ p:Provenance; small?:boolean }) => {
+  const m = PROV[p];
+  return (
+    <span className={`inline-flex items-center gap-1.5 border rounded-sm font-mono uppercase tracking-wider
+      ${small ? 'text-[9px] px-1.5 py-[1px]' : 'text-[10px] px-2 py-0.5'} ${m.dashed ? 'border-dashed' : ''}`}
+      style={{ color:m.color, borderColor:m.color + '55', background:m.color + '0f' }}>
+      <span className="w-1.5 h-1.5 rounded-full" style={{ background:m.color }}></span>{m.label}
+    </span>
+  );
+};
+
+const Row = ({ k, v }:{ k:string; v:string }) =>
+  <div className="flex justify-between gap-3">
+    <span className="text-dim tracking-wider shrink-0">{k}</span>
+    <span className="text-mist text-right">{v}</span>
+  </div>;
+
+const Stat = ({ label, value, unit, color }:{ label:string; value:string; unit:string; color:string }) =>
+  <div className="p-2 rounded bg-white/[0.03] border border-line">
+    <div className="font-mono text-[8px] tracking-[0.2em]" style={{ color }}>{label}</div>
+    <div className="font-mono text-[14px] text-mist mt-0.5">{value}</div>
+    <div className="font-mono text-[8px] text-dim">{unit}</div>
+  </div>;
+
+/* ============================================================================
+ * 9 · HUD COMPONENTS
+ * ==========================================================================*/
+const Boot = ({ msg }:{ msg:string }) =>
+  <div className="absolute inset-0 z-50 bg-abyss flex flex-col items-center justify-center gap-6">
+    <span className="text-accent"><Icon name="Waves" size={30}/></span>
+    <div className="text-center">
+      <div className="text-[17px] font-semibold tracking-[0.35em] text-mist">PELAGOS</div>
+      <div className="text-[8.5px] tracking-[0.32em] text-dim mt-2">IMMERSIVE OCEAN OBSERVATORY · SIH-26067</div>
+    </div>
+    <div className="w-44 h-[2px] bg-white/[0.08] overflow-hidden rounded">
+      <div className="h-full w-1/3 bg-accent boot-bar"/></div>
+    <div className="font-mono text-[9.5px] tracking-[0.2em] text-dim">{msg}</div>
+  </div>;
+
+const Veil = ({ show, bgOn, text, showSkip, onSkip }:
+  { show:boolean; bgOn:boolean; text:string; showSkip:boolean; onSkip:()=>void }) =>
+  <div className={`absolute inset-0 z-40 pointer-events-none transition-opacity duration-700 ${show ? 'opacity-100' : 'opacity-0'}`}>
+    <div className={`absolute inset-0 bg-[#0d4257] transition-opacity ease-in ${bgOn ? 'opacity-100' : 'opacity-0'}`}
+      style={{ transitionDuration:bgOn ? '1500ms' : '500ms' }}/>
+    <div className={`absolute bottom-24 left-1/2 -translate-x-1/2 transition-opacity duration-700 ${show ? 'opacity-100' : 'opacity-0'}`}>
+      <div className="font-mono text-[10px] tracking-[0.3em] text-[#a8dbe6] text-center whitespace-nowrap">{text}</div>
+      {showSkip &&
+        <div className="flex justify-center mt-3 pointer-events-auto">
+          <button onClick={onSkip}
+            className="border border-[#56d4e2]/40 text-[#7cc9d6] hover:bg-[#56d4e2]/10 rounded px-3 py-1.5 text-[9px] font-mono tracking-[0.25em]">
+            SKIP</button>
+        </div>}
+    </div>
+  </div>;
+
+const TopBar = () => {
+  const s = useApp(); const uw = s.phase === 'underwater';
+  return (
+    <div className="absolute top-0 left-0 right-0 h-12 z-30 flex items-center px-3 md:px-4 border-b border-line bg-[#040a10]/70 backdrop-blur-sm">
+      <div className="flex items-center gap-2.5">
+        <span className="text-accent"><Icon name="Waves" size={18}/></span>
+        <div className="leading-none">
+          <div className="text-[13px] font-semibold tracking-[0.22em] text-mist">PELAGOS</div>
+          <div className="hidden md:block text-[8px] tracking-[0.3em] text-dim mt-1">IMMERSIVE OCEAN OBSERVATORY</div>
+        </div>
+      </div>
+      {uw &&
+        <div className="absolute left-1/2 -translate-x-1/2 flex items-center gap-0.5 bg-white/[0.03] border border-line rounded-md p-0.5">
+          {VARIABLES.map(v =>
+            <button key={v.key} onClick={() => store.set({ variable:v.key })}
+              className={`flex items-center gap-1.5 px-2 md:px-2.5 py-1.5 rounded text-[10px] font-mono tracking-widest transition-colors
+                ${s.variable === v.key ? 'text-accent bg-accent/10' : 'text-dim hover:text-mist'}`}>
+              <Icon name={v.icon} size={13}/><span className="hidden md:inline">{v.label}</span>
+            </button>)}
+        </div>}
+      <div className="ml-auto flex items-center gap-2">
+        {uw && <span className="font-mono text-[10px] text-dim hidden sm:inline">{timeUTC(s.timeOffset)}</span>}
+        <span className="font-mono text-[9px] tracking-[0.2em] text-dim border border-line rounded px-2 py-1">SIH-26067</span>
+      </div>
+    </div>
+  );
+};
+
+const SiteExplorer = () => {
+  const s = useApp(); const [q, setQ] = useState('');
+  const sites = Ocean.listSites();
+  const filtered = sites.filter(x => (x.name + ' ' + x.region).toLowerCase().includes(q.toLowerCase()));
+  const select = async (site:SitePhysics) => {
+    store.set({ site, selection:null });
+    globeRegistry.g?.showSite(site); globeRegistry.g?.flyToSite(site);
+    toast('FETCHING LIVE OCEAN DATA…');
+    const enriched = await DataService.enrich(site);
+    if (store.get().site?.id === site.id){
+      store.set({ site:enriched });
+      globeRegistry.g?.showSite(enriched);
+      toast(DataService.online ? 'LIVE DATA LINKED · ARGO + MODEL FIELDS'
+                               : 'BACKEND OFFLINE — USING MODEL PHYSICS');
+    }
+  };
+  return (
+    <div className={`absolute left-3 md:left-4 top-16 w-[calc(100vw-24px)] sm:w-[320px] z-20 flex flex-col glass overflow-hidden
+      ${s.site ? 'bottom-[244px] md:bottom-[232px]' : 'bottom-16 md:bottom-6'}`}>
+      <div className="px-3.5 pt-3 pb-2 flex items-baseline justify-between">
+        <span className="text-[10px] font-mono tracking-[0.25em] text-dim">STUDY SITES</span>
+        <span className="text-[10px] font-mono text-dim">{filtered.length}/{sites.length}</span>
+      </div>
+      <div className="px-3 pb-2.5">
+        <div className="flex items-center gap-2 bg-white/[0.04] border border-line rounded px-2.5 py-2">
+          <span className="text-dim"><Icon name="Search" size={13}/></span>
+          <input value={q} onChange={e => setQ(e.target.value)} placeholder="Search ocean regions…"
+            className="bg-transparent outline-none text-[12px] text-mist placeholder:text-dim/70 w-full"/>
+          {q && <button onClick={() => setQ('')} className="text-dim hover:text-mist"><Icon name="X" size={12}/></button>}
+        </div>
+      </div>
+      <div className="flex-1 overflow-y-auto px-1.5 pb-2">
+        {filtered.map((site, i) => {
+          const active = s.site?.id === site.id;
+          return (
+            <button key={site.id} onClick={() => select(site)}
+              className={`w-full text-left px-2.5 py-2.5 rounded-md flex gap-3 items-start border-l-2 transition-colors
+                ${active ? 'border-accent bg-accent/[0.07]' : 'border-transparent hover:bg-white/[0.04]'}`}>
+              <span className={`font-mono text-[10px] pt-0.5 ${active ? 'text-accent' : 'text-dim'}`}>{pad2(i+1)}</span>
+              <span className="min-w-0">
+                <span className={`block text-[12.5px] font-medium truncate ${active ? 'text-accent' : 'text-mist'}`}>{site.name}</span>
+                <span className="block font-mono text-[9.5px] text-dim mt-1 truncate">
+                  {site.region} · {fmtLat(site.lat)} {fmtLon(site.lon)} · floor {fmtDepth(site.maxDepth)}
+                </span>
+              </span>
+            </button>);
+        })}
+        {filtered.length === 0 && <div className="px-3 py-6 text-[11px] text-dim font-mono">No matching region.</div>}
+      </div>
+      <div className="px-3.5 py-2.5 border-t border-line text-[9.5px] font-mono text-dim leading-relaxed">
+        Or click anywhere in the ocean to drop a study point.
+      </div>
+    </div>
+  );
+};
+
+const SitePanel = ({ onDive }:{ onDive:() => void }) => {
+  const s = useApp(); const site = s.site!;
+  const stats = useMemo(() => Ocean.surfaceStats(site, s.timeOffset), [site.id, Math.round(s.timeOffset*2)]);
+  return (
+    <div className="absolute bottom-4 md:bottom-6 left-1/2 -translate-x-1/2 z-20 w-[min(600px,calc(100vw-24px))] glass px-4 md:px-5 py-3.5">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="flex items-center gap-2 flex-wrap">
+            <h2 className="text-[15px] font-semibold text-mist truncate">{site.name}</h2>
+            <span className="font-mono text-[10px] text-accent">{fmtLat(site.lat)} {fmtLon(site.lon)}</span>
+          </div>
+          <p className="text-[10.5px] text-dim mt-1 leading-snug line-clamp-2">{site.blurb}</p>
+        </div>
+        <button onClick={() => { store.set({ site:null }); globeRegistry.g?.clearSite(); }}
+          className="text-dim hover:text-mist p-1"><Icon name="X" size={15}/></button>
+      </div>
+      <div className="grid grid-cols-4 gap-2 mt-3">
+        {[['SST', stats.sst.toFixed(1), '°C'], ['SSS', stats.sss.toFixed(2), 'PSU'],
+          ['SURF CURRENT', stats.cur.speed.toFixed(2), 'm/s'], ['SEAFLOOR', fmtDepth(site.maxDepth), '']].map(r =>
+          <div key={r[0]}>
+            <div className="text-[8px] font-mono tracking-[0.18em] text-dim">{r[0]}</div>
+            <div className="font-mono text-[13px] text-mist mt-0.5">{r[1]} <span className="text-[8px] text-dim">{r[2]}</span></div>
+          </div>)}
+      </div>
+      <div className="flex items-center justify-between mt-3.5 pt-3 border-t border-line">
+        <ProvenanceBadge p={provFor(s.timeOffset).provenance} small/>
+        <div className="flex gap-2">
+          <button onClick={() => globeRegistry.g?.flyToSite(site)}
+            className="flex gap-1.5 items-center text-dim hover:text-mist border border-line hover:border-accent/40 rounded px-2.5 py-2 text-[10px] font-mono tracking-widest">
+            <Icon name="LocateFixed" size={12}/>RECENTER</button>
+          <button onClick={onDive}
+            className="bg-accent hover:bg-[#7ce0ec] text-[#03222a] text-[11px] font-semibold tracking-wider px-4 py-2 rounded flex gap-1.5 items-center">
+            <Icon name="ArrowDownToLine" size={13}/>DIVE</button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+const DepthControl = () => {
+  const s = useApp(); const site = s.site!; const dmax = site.maxDepth;
+  const ref = useRef<HTMLDivElement>(null); const dragRef = useRef(false);
+  const frac = Math.pow(clamp(s.depth/dmax, 0, 1), 1/3.2);
+  const pf = (d:number) => Math.pow(clamp(d/dmax, 0, 1), 1/3.2)*100;
+  const setFrom = (e:any) => {
+    const r = ref.current!.getBoundingClientRect();
+    const f = clamp((e.clientY - r.top)/r.height, 0, 1);
+    store.set({ depth:Math.max(8, Math.round(dmax*Math.pow(f, 3.2))) });
+  };
+  const floats = useMemo(() => Ocean.floatsAt(site), [site.id]);
+  const ticks = [50, 100, 200, 500, 1000, 2000, 4000, 6000, 8000].filter(t => t < dmax*0.92);
+  return (
+    <div className="absolute left-3 md:left-4 top-1/2 -translate-y-1/2 z-20 flex flex-col items-center gap-2">
+      <div className="glass px-2.5 py-1 font-mono text-[10.5px] text-accent">{Math.round(s.depth)} m</div>
+      <div ref={ref} className="glass relative w-12 h-[34vh] max-h-[320px] min-h-[170px] cursor-ns-resize touch-none"
+        onPointerDown={e => { dragRef.current = true; (e.currentTarget as any).setPointerCapture(e.pointerId); setFrom(e); }}
+        onPointerMove={e => { if (dragRef.current) setFrom(e); }}
+        onPointerUp={() => { dragRef.current = false; }} onPointerCancel={() => { dragRef.current = false; }}>
+        <div className="absolute top-3 bottom-3 left-1/2 -translate-x-1/2 w-[3px] bg-white/10 rounded-sm">
+          <div className="absolute top-0 left-0 w-full bg-accent/40 rounded-sm" style={{ height:`${frac*100}%` }}/>
+          {floats.map((f, i) =>
+            <button key={i} title={`Argo ${f.id} · ${Math.round(f.parkingDepth)} m`}
+              onPointerDown={e => { e.stopPropagation();
+                store.set({ depth:clamp(Math.round(f.parkingDepth), 8, dmax) });
+                toast(`Argo ${f.id} parks near ${Math.round(f.parkingDepth)} m`); }}
+              className="absolute -left-[3.5px] w-[10px] h-[10px] rounded-full border border-accent bg-abyss hover:bg-accent/40"
+              style={{ top:`calc(${pf(clamp(f.parkingDepth, 15, dmax))}% - 5px)` }}/>)}
+          <div className="absolute -left-[7px] w-[17px] h-[17px] rounded-full bg-[#06121a] border-2 border-accent"
+            style={{ top:`calc(${frac*100}% - 8px)` }}/>
+        </div>
+        {ticks.map(t =>
+          <button key={t} onPointerDown={e => { e.stopPropagation(); store.set({ depth:t }); }}
+            className={`absolute left-[30px] -translate-y-1/2 whitespace-nowrap font-mono text-[8.5px] text-dim hover:text-accent
+              ${t % 1000 === 0 ? '' : 'hidden sm:block'}`}
+            style={{ top:`calc(12px + ${pf(t)/100} * (100% - 24px))`, textShadow:'0 1px 3px rgba(0,0,0,0.9)' }}>
+            {t >= 1000 ? (t/1000) + 'k' : t}
+          </button>)}
+        <div className="absolute bottom-1 left-0 right-0 text-center font-mono text-[7.5px] text-dim tracking-wider">FLOOR</div>
+      </div>
+    </div>
+  );
+};
+
+const Timeline = () => {
+  const s = useApp();
+  useEffect(() => {
+    if (!s.playing) return;
+    const iv = setInterval(() => {
+      const t = store.get().timeOffset;
+      if (t >= 48) store.set({ timeOffset:48, playing:false });
+      else store.set({ timeOffset:Math.min(48, t + 0.5) });
+    }, 160);
+    return () => clearInterval(iv);
+  }, [s.playing]);
+  const pv = provFor(s.timeOffset);
+  const pct = (t:number) => ((t + 48)/96)*100;
+  return (
+    <div className="absolute bottom-4 left-1/2 -translate-x-1/2 z-20 w-[calc(100vw-124px)] sm:w-[min(560px,calc(100vw-380px))]">
+      <div className="glass px-3 pt-2.5 pb-2">
+        <div className="flex items-center gap-2.5">
+          <button onClick={() => store.set({ playing:!s.playing, timeOffset:s.timeOffset >= 48 ? -48 : s.timeOffset })}
+            className="text-accent hover:text-mist w-7 h-7 flex items-center justify-center border border-line rounded">
+            <Icon name={s.playing ? 'Pause' : 'Play'} size={13}/></button>
+          <button onClick={() => store.set({ timeOffset:0, playing:false })} title="Back to now"
+            className="text-dim hover:text-mist w-7 h-7 flex items-center justify-center border border-line rounded">
+            <Icon name="RotateCcw" size={12}/></button>
+          <span className="font-mono text-[10.5px] text-mist tracking-wide">{timeUTC(s.timeOffset)}</span>
+          <span className="ml-auto"><ProvenanceBadge p={pv.provenance} small/></span>
+        </div>
+        <div className="relative mt-2.5 h-4">
+          <div className="absolute inset-x-0 top-1/2 -translate-y-1/2 h-[3px] rounded-sm overflow-hidden flex">
+            <div style={{ width:`${pct(-2)}%` }} className="bg-[#8fb0c9]/30"/>
+            <div style={{ width:`${pct(2) - pct(-2)}%` }} className="bg-[#9db0ba]/40"/>
+            <div style={{ width:`${100 - pct(2)}%` }} className="hatch"/>
+          </div>
+          <input type="range" min={-48} max={48} step={0.25} value={s.timeOffset}
+            onChange={e => store.set({ timeOffset:parseFloat(e.target.value) })}
+            className="tl-range absolute inset-0 w-full"/>
+        </div>
+        <div className="flex justify-between mt-1 font-mono text-[8.5px] text-dim">
+          <span>-48 h</span><span className="hidden sm:inline">-24</span>
+          <span className="text-mist">NOW</span>
+          <span className="hidden sm:inline">+24</span><span>+48 h</span>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+const ProfileStrip = ({ prof, depth, active }:{ prof:ProfileResult; depth:number; active:VariableKey }) => {
+  const W = 200, H = 88, L = 4, R = 4, T = 4, B = 4;
+  const site = store.get().site!;
+  const rg = Ocean.rangeAt(site, active);
+  const zmax = Math.max(prof.zmax, 1);
+  const y = (z:number) => T + (clamp(z, 0, zmax)/zmax)*(H - T - B);
+  const x = (v:number) => L + clamp((v - rg.min)/Math.max(1e-6, rg.max - rg.min), 0, 1)*(W - L - R);
+  const d = prof.points.map((p, i) => `${i ? 'L' : 'M'}${x(p[FIELD[active]]).toFixed(1)} ${y(p.depth).toFixed(1)}`).join(' ');
+  const cy = y(depth);
+  const near = prof.points.reduce((a, b) => Math.abs(b.depth - depth) < Math.abs(a.depth - depth) ? b : a);
+  return (
+    <svg width="100%" viewBox={`0 0 ${W} ${H}`} className="block">
+      {[500, 1000, 1500].filter(z => z <= zmax).map(z =>
+        <line key={z} x1={L} y1={y(z)} x2={W-R} y2={y(z)} stroke="rgba(126,196,207,0.12)" strokeDasharray="2 3"/>)}
+      <path d={d} fill="none" stroke={VAR_COLORS[active]} strokeWidth="1.6"/>
+      <line x1={L} y1={cy} x2={W-R} y2={cy} stroke="#56d4e2" strokeWidth="0.8" strokeDasharray="3 2" opacity="0.9"/>
+      <circle cx={x(near[FIELD[active]])} cy={y(near.depth)} r="2.4" fill="#56d4e2"/>
+      {zmax >= 1000 && <text x={W-R-1} y={y(1000)+3} textAnchor="end" fontSize="7" fill="#8fa6b0" fontFamily="IBM Plex Mono">1000 m</text>}
+    </svg>
+  );
+};
+
+const LegendPanel = () => {
+  const s = useApp(); const site = s.site!;
+  const vm = VARIABLES.find(v => v.key === s.variable)!;
+  const cm = CMAPS[s.variable];
+  const [open, setOpen] = useState(!isMobile);
+  const range = Ocean.rangeAt(site, s.variable);
+  const val = Ocean.variableAt(site, 0, 0, s.depth, s.timeOffset, s.variable, 0);
+  const prof = useMemo(() => Ocean.profileAt(site, site.lat, site.lon, s.timeOffset), [site.id, Math.round(s.timeOffset/2)]);
+  return (
+    <div className="absolute bottom-4 left-3 md:left-4 z-20 w-[224px] glass overflow-hidden">
+      <button onClick={() => setOpen(!open)} className="w-full flex items-center justify-between px-3 py-2.5">
+        <span className="text-[10px] font-mono tracking-[0.25em] text-dim">LEGEND</span>
+        <span className="text-dim"><Icon name={open ? 'ChevronDown' : 'ChevronUp'} size={13}/></span>
+      </button>
+      {open &&
+        <div className="px-3 pb-3">
+          <div className="flex items-baseline justify-between gap-2">
+            <span className="text-[11.5px] font-medium text-mist">{cm.label}</span>
+            <span className="font-mono text-[9px] text-dim">{vm.unit} · {cm.ref}</span>
+          </div>
+          <div className="h-2.5 rounded-sm mt-2 border border-white/10" style={{ background:cssGradient(cm.stops) }}/>
+          <div className="flex justify-between font-mono text-[9px] text-dim mt-1">
+            <span>{range.min.toFixed(vm.digits)}</span><span>{range.max.toFixed(vm.digits)}</span>
+          </div>
+          <div className="mt-2 font-mono text-[10.5px] text-accent">@ {Math.round(s.depth)} m — {val.toFixed(vm.digits)} {vm.unit}</div>
+          <div className="mt-2.5 hidden md:block"><ProfileStrip prof={prof} depth={s.depth} active={s.variable}/></div>
+          <div className="mt-3 pt-2.5 border-t border-line space-y-1.5">
+            {(['observed','interpolated','modelled','predicted'] as Provenance[]).map(p =>
+              <div key={p} className="flex items-center gap-2">
+                <ProvenanceBadge p={p} small/>
+                <span className="font-mono text-[8.5px] text-dim">{PROV_SRC[p]}</span>
+              </div>)}
+          </div>
+        </div>}
+    </div>
+  );
+};
+
+const ProfileChart = ({ prof, depth, active }:{ prof:ProfileResult; depth:number; active:VariableKey }) => {
+  const W = 260, H = 140, L = 34, R = 8, T = 8, B = 8;
+  const site = store.get().site!;
+  const zmax = Math.max(prof.zmax, 1);
+  const y = (z:number) => T + (clamp(z, 0, zmax)/zmax)*(H - T - B);
+  const rgA = Ocean.rangeAt(site, active);
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} className="w-full block">
+      {[500, 1000, 1500, 2000].filter(z => z <= zmax).map(z =>
+        <g key={z}>
+          <line x1={L} y1={y(z)} x2={W-R} y2={y(z)} stroke="rgba(126,196,207,0.1)"/>
+          <text x={W-R} y={y(z)+3} textAnchor="end" fontSize="7" fill="#667f8a" fontFamily="IBM Plex Mono">{z >= 1000 ? (z/1000)+'k' : z}</text>
+        </g>)}
+      {(['temp','sal','cur','oxy'] as VariableKey[]).map(k => {
+        const rg = Ocean.rangeAt(site, k);
+        const d = prof.points.map((p, i) =>
+          `${i ? 'L' : 'M'}${(L + clamp((p[FIELD[k]] - rg.min)/Math.max(1e-6, rg.max - rg.min), 0, 1)*(W - L - R)).toFixed(1)} ${y(p.depth).toFixed(1)}`).join(' ');
+        return <path key={k} d={d} fill="none" stroke={VAR_COLORS[k]} strokeWidth={k === active ? 2 : 1} opacity={k === active ? 1 : 0.3}/>;
+      })}
+      <line x1={L} y1={y(depth)} x2={W-R} y2={y(depth)} stroke="#56d4e2" strokeDasharray="3 2" strokeWidth="0.8"/>
+      <text x={L-4} y={y(depth)+3} textAnchor="end" fontSize="7.5" fill="#56d4e2" fontFamily="IBM Plex Mono">{Math.round(depth)} m</text>
+      <text x={2} y={T+6} fontSize="7" fill="#8fa6b0" fontFamily="IBM Plex Mono">{rgA.max.toFixed(1)}</text>
+      <text x={2} y={H-B} fontSize="7" fill="#8fa6b0" fontFamily="IBM Plex Mono">{rgA.min.toFixed(1)}</text>
+    </svg>
+  );
+};
+
+const Inspector = () => {
+  const s = useApp(); const site = s.site!; const sel = s.selection!;
+  const isFloat = sel.kind === 'float';
+  const f = isFloat ? Ocean.floatsAt(site).find(x => x.id === sel.id) : null;
+  const tOff = isFloat ? (f ? f.lastReportOffset : 0) : s.timeOffset;
+  const prov:ProvInfo = isFloat
+    ? { provenance:'observed', source:f ? f.source : 'Argo GDAC', label:'Observation' }
+    : provFor(s.timeOffset);
+  const depth = isFloat ? clamp(s.depth, 2, 2000) : clamp((sel as any).depth, 2, site.maxDepth);
+  const pos:LatLon = isFloat && f ? { lat:f.lat, lon:f.lon } : { lat:(sel as any).lat, lon:(sel as any).lon };
+  const sample = useMemo(
+    () => isFloat && f ? Ocean.sampleFromFloat(f, depth)
+                       : Ocean.sampleAt(site, pos.lat, pos.lon, depth, s.timeOffset),
+    [site.id, isFloat, f && f.id, depth, s.timeOffset]);
+  const prof = useMemo(
+    () => Ocean.profileAt(site, pos.lat, pos.lon, tOff),
+    [site.id, pos.lat.toFixed(3), pos.lon.toFixed(3), Math.round(tOff)]);
+  const note = Ocean.interpretNote(sample, depth, site);
+  const copy = () => {
+    try {
+      navigator.clipboard.writeText(JSON.stringify({
+        platform: isFloat ? `Argo ${f?.id}` : 'virtual sample',
+        time: timeISO(tOff), position:{ lat:+pos.lat.toFixed(4), lon:+pos.lon.toFixed(4) },
+        depth_m: Math.round(depth), provenance: prov.provenance, source: prov.source,
+        temperature_C: +sample.temperature.toFixed(3), salinity_PSU: +sample.salinity.toFixed(3),
+        current_mps: +sample.currentSpeed.toFixed(3), current_dir_deg: +sample.currentDir.toFixed(1),
+        oxygen_umolkg: +sample.oxygen.toFixed(2),
+      }, null, 2));
+      toast('Inspector data copied as JSON');
+    } catch(e){ toast('Clipboard unavailable in this browser'); }
+  };
+  return (
+    <div className="absolute z-30 right-3 md:right-4 top-14 bottom-4 max-md:left-3 max-md:top-auto max-md:bottom-3 max-md:max-h-[54vh]
+      w-[calc(100vw-24px)] md:w-[292px] glass flex flex-col overflow-hidden">
+      <div className="flex items-center gap-2 px-3.5 py-3 border-b border-line">
+        <span className="text-accent"><Icon name={isFloat ? 'Radio' : 'Crosshair'} size={15}/></span>
+        <div className="min-w-0 flex-1">
+          <div className="text-[12.5px] font-medium text-mist truncate">{isFloat ? `Argo ${f?.id}` : 'Virtual water sample'}</div>
+          <div className="font-mono text-[8.5px] text-dim tracking-wider">{isFloat ? 'IN-SITU OBSERVATION' : 'MODEL FIELD PROBE'}</div>
+        </div>
+        <button onClick={() => store.set({ selection:null })} className="text-dim hover:text-mist"><Icon name="X" size={14}/></button>
+      </div>
+      <div className="flex-1 overflow-y-auto px-3.5 py-3">
+        <div className="flex items-center gap-2 flex-wrap">
+          <ProvenanceBadge p={prov.provenance}/>
+          <span className="font-mono text-[9px] text-dim">{prov.label}</span>
+        </div>
+        <div className="mt-3 space-y-1.5 font-mono text-[10px]">
+          <Row k="POSITION" v={`${fmtLat(pos.lat, 3)} ${fmtLon(pos.lon, 3)}`}/>
+          <Row k="DEPTH" v={fmtDepth(depth)}/>
+          <Row k="TIMESTAMP" v={timeISO(tOff)}/>
+          {isFloat && f && <Row k="CYCLE" v={`#${f.cycle} · reported ${Math.round(Math.abs(f.lastReportOffset))} h ago`}/>}
+          {!isFloat && <Row k="FIELD" v={`${prov.label} · 0.25° grid`}/>}
+        </div>
+        <div className="mt-3 p-2.5 rounded bg-white/[0.03] border border-line">
+          <div className="text-[8.5px] font-mono text-dim tracking-[0.2em] mb-1.5">SOURCE</div>
+          <div className="text-[10px] text-mist/90 leading-snug">{prov.source}</div>
+        </div>
+        <div className="grid grid-cols-2 gap-2 mt-3">
+          <Stat label="TEMP" value={sample.temperature.toFixed(2)} unit="°C" color={VAR_COLORS.temp}/>
+          <Stat label="SAL" value={sample.salinity.toFixed(2)} unit="PSU" color={VAR_COLORS.sal}/>
+          <Stat label="CURRENT" value={sample.currentSpeed.toFixed(2)} unit={`m/s @ ${Math.round(sample.currentDir)}°T`} color={VAR_COLORS.cur}/>
+          <Stat label="O₂" value={sample.oxygen.toFixed(1)} unit="µmol/kg" color={VAR_COLORS.oxy}/>
+        </div>
+        <div className="mt-3">
+          <div className="text-[8.5px] font-mono text-dim tracking-[0.2em] mb-1.5">PROFILE · 0–{Math.round(prof.zmax)} m</div>
+          <ProfileChart prof={prof} depth={depth} active={s.variable}/>
+        </div>
+        <div className="mt-3 flex gap-2 items-start text-dim">
+          <span className="mt-0.5 shrink-0"><Icon name="Info" size={12}/></span>
+          <p className="text-[10px] leading-relaxed">{note}</p>
+        </div>
+        <button onClick={copy}
+          className="mt-3 w-full flex items-center justify-center gap-2 border border-line hover:border-accent/40 text-dim hover:text-mist rounded py-2 text-[10px] font-mono tracking-widest">
+          <Icon name="Copy" size={12}/>COPY JSON
+        </button>
+      </div>
+    </div>
+  );
+};
+
+const CompassHud = () => {
+  const s = useApp(); const site = s.site!;
+  const [yaw, setYaw] = useState(0);
+  useEffect(() => {
+    const iv = setInterval(() => setYaw(uwRegistry.e?.getYaw() ?? 0), 130);
+    return () => clearInterval(iv);
+  }, []);
+  const deg = mod(-yaw*180/Math.PI, 360);
+  return (
+    <div className="absolute bottom-4 right-3 md:right-4 z-20 flex flex-col items-end gap-2">
+      <div className="glass px-2.5 py-2 flex flex-col items-center gap-1.5">
+        <svg width="52" height="52" viewBox="0 0 52 52">
+          <circle cx="26" cy="26" r="22" fill="none" stroke="rgba(126,196,207,0.25)"/>
+          {Array.from({ length:8 }).map((_, i) => {
+            const a = i*Math.PI/4;
+            return <line key={i} x1={26 + Math.sin(a)*18} y1={26 - Math.cos(a)*18}
+              x2={26 + Math.sin(a)*22} y2={26 - Math.cos(a)*22}
+              stroke="rgba(126,196,207,0.35)" strokeWidth={i % 2 ? 0.7 : 1.2}/>;
+          })}
+          <g transform={`rotate(${deg} 26 26)`}>
+            <path d="M26 4 L30 12 L26 9.5 L22 12 Z" fill="#56d4e2"/>
+            <line x1="26" y1="12" x2="26" y2="20" stroke="#56d4e2" strokeWidth="1.4"/>
+          </g>
+          <circle cx="26" cy="26" r="1.8" fill="#d9e7ec"/>
+        </svg>
+        <span className="font-mono text-[9px] text-dim">{String(Math.round(deg)).padStart(3, '0')}°</span>
+      </div>
+      <button title="Reset camera" onClick={() => { uwRegistry.e?.resetView(); toast('Camera reset'); }}
+        className="glass w-8 h-8 flex items-center justify-center text-dim hover:text-accent">
+        <Icon name="RotateCcw" size={14}/>
+      </button>
+      <div className="glass px-2.5 py-1.5 font-mono text-[9px] text-dim text-right leading-relaxed">
+        {fmtLat(site.lat)} {fmtLon(site.lon)}<br/>
+        <span className="text-accent">DEPTH {Math.round(s.depth)} m</span>
+      </div>
+    </div>
+  );
+};
+
+const CoordReadout = () => {
+  const [c, setC] = useState<LatLon|null>(null);
+  useEffect(() => {
+    const iv = setInterval(() => setC(globeRegistry.g?.getHover() ?? null), 120);
+    return () => clearInterval(iv);
+  }, []);
+  return (
+    <div className="glass px-2.5 py-1.5 font-mono text-[9.5px] text-dim min-w-[150px] text-center">
+      {c ? `${fmtLat(c.lat, 3)}  ${fmtLon(c.lon, 3)}` : '— · —'}
+    </div>
+  );
+};
+
+const Hint = ({ text, cls }:{ text:string; cls?:string }) => {
+  const [show, setShow] = useState(true);
+  useEffect(() => { const t = setTimeout(() => setShow(false), 9000); return () => clearTimeout(t); }, []);
+  return (
+    <div className={`absolute z-10 transition-opacity duration-1000 pointer-events-none ${cls || 'top-16 left-1/2 -translate-x-1/2'} ${show ? 'opacity-100' : 'opacity-0'}`}>
+      <span className="font-mono text-[9px] tracking-[0.22em] text-dim bg-abyss/70 border border-line rounded px-3 py-1.5 whitespace-nowrap">{text}</span>
+    </div>
+  );
+};
+
+const UnderwaterHUD = ({ onAscend }:{ onAscend:() => void }) => {
+  const s = useApp(); const site = s.site!;
+  return (
+    <React.Fragment>
+      <div className="absolute top-14 left-3 md:left-4 z-20 flex items-center gap-2.5">
+        <button onClick={onAscend}
+          className="glass flex items-center gap-2 px-3 py-2 text-[10px] font-mono tracking-widest text-mist hover:text-accent hover:border-accent/40">
+          <Icon name="ArrowUpToLine" size={13}/>SURFACE</button>
+        <div className="leading-tight">
+          <div className="text-[12.5px] font-medium text-mist">{site.name}</div>
+          <div className="font-mono text-[9px] text-dim">{fmtLat(site.lat)} {fmtLon(site.lon)} · floor {fmtDepth(site.maxDepth)}</div>
+        </div>
+      </div>
+      <DepthControl/>
+      <Timeline/>
+      <LegendPanel/>
+      <CompassHud/>
+    </React.Fragment>
+  );
+};
+
+/* ============================================================================
+ * 10 · APP — orchestration: boot → globe → dive → underwater → ascend
+ * ==========================================================================*/
+const App = () => {
+  const s = useApp();
+  const globeEl = useRef<HTMLDivElement>(null);
+  const uwEl = useRef<HTMLDivElement>(null);
+  const uwRef = useRef<UnderwaterEngine|null>(null);
+  const [veilBg, setVeilBg] = useState(false);
+  const [veilText, setVeilText] = useState('');
+  const [bootMsg, setBootMsg] = useState('INITIALIZING GEOSPATIAL ENGINE…');
+  const skipRef = useRef<() => void>(() => {});
+
+  useEffect(() => {
+    const g = new GlobeEngine(); globeRegistry.g = g;
+    g.init(globeEl.current!, {
+      onReady:() => store.set({ phase:'globe' }),
+      onError:(m) => setBootMsg(m),
+      onPickPoint:(lat, lon) => {
+        if (store.get().phase !== 'globe') return;
+        const site = Ocean.siteForPoint(lat, lon);
+        store.set({ site, selection:null });
+        g.showSite(site); g.flyToSite(site);
+      },
+      onPickFloat:(id) => store.set({ selection:{ kind:'float', id } }),
+    });
+    return () => { g.destroy(); globeRegistry.g = null; };
+  }, []);
+
+  // dive orchestration
+  useEffect(() => {
+    if (s.phase !== 'diving' || !s.site) return;
+    const g = globeRegistry.g!; const site = s.site;
+    g.diveTo(site, () => {});
+    setVeilText(`DESCENDING · ${site.name.toUpperCase()}`);
+    const t1 = setTimeout(() => setVeilBg(true), 3300);
+    const complete = () => {
+      if (store.get().phase !== 'diving') return;
+      store.set({ phase:'underwater', depth:60, selection:null });
+      g.setPaused(true); setVeilBg(false);
+    };
+    skipRef.current = complete;
+    const t2 = setTimeout(complete, 5400);
+    return () => { clearTimeout(t1); clearTimeout(t2); };
+  }, [s.phase, s.site?.id]);
+
+  // underwater engine mounts after commit, when its container is visible
+  useEffect(() => {
+    if (s.phase !== 'underwater' || uwRef.current) return;
+    const st = store.get(); const site = st.site!;
+    const uw = new UnderwaterEngine();
+    try {
+      uw.mount(uwEl.current!, site, {
+        onSelect:(sel) => store.set({ selection:sel }),
+        onDepthDelta:(d) => { const cur = store.get();
+          store.set({ depth:clamp(cur.depth + d, 8, cur.site!.maxDepth) }); },
+      });
+      uw.setParams({ depth:st.depth, variable:st.variable, timeOffset:st.timeOffset });
+      uwRef.current = uw; uwRegistry.e = uw;
+    } catch (err:any) {
+      uw.dispose();
+      toast('UNDERWATER RENDERER UNAVAILABLE — WEBGL MAY BE DISABLED');
+      globeRegistry.g?.setPaused(false);
+      store.set({ phase:'globe' });
+    }
+  }, [s.phase]);
+
+  // ascend orchestration
+  const ascend = () => { if (!s.site) return;
+    store.set({ phase:'ascending', selection:null }); setVeilText('SURFACING'); };
+  useEffect(() => {
+    if (s.phase !== 'ascending') return;
+    setVeilBg(true);
+    const t1 = setTimeout(() => {
+      uwRef.current?.dispose(); uwRef.current = null; uwRegistry.e = null;
+      const g = globeRegistry.g!;
+      g.setPaused(false); store.set({ phase:'globe' });
+      g.ascendFrom(store.get().site!);
+    }, 750);
+    const t2 = setTimeout(() => setVeilBg(false), 3400);
+    return () => { clearTimeout(t1); clearTimeout(t2); };
+  }, [s.phase]);
+
+  // live param sync into the running engine
+  useEffect(() => { uwRef.current?.setParams({ depth:s.depth, variable:s.variable, timeOffset:s.timeOffset }); },
+    [s.depth, s.variable, s.timeOffset]);
+  useEffect(() => { uwRef.current?.setSelection(s.selection); }, [s.selection]);
+
+  // keyboard
+  useEffect(() => {
+    const h = (e:KeyboardEvent) => {
+      const st = store.get();
+      if (e.key === 'Escape') store.set({ selection:null });
+      if (st.phase === 'underwater' && st.site){
+        if (e.key === 'ArrowUp')   store.set({ depth:clamp(st.depth + (e.shiftKey ? 100 : 10), 8, st.site.maxDepth) });
+        if (e.key === 'ArrowDown') store.set({ depth:clamp(st.depth - (e.shiftKey ? 100 : 10), 8, st.site.maxDepth) });
+      }
+    };
+    window.addEventListener('keydown', h);
+    return () => window.removeEventListener('keydown', h);
+  }, []);
+
+  // toast autoclear
+  useEffect(() => {
+    if (!s.toast) return;
+    const t = setTimeout(() => store.set({ toast:null }), 2400);
+    return () => clearTimeout(t);
+  }, [s.toast?.id]);
+
+  return (
+    <div className="fixed inset-0 bg-abyss text-mist font-disp overflow-hidden">
+      <div ref={globeEl} className={`absolute inset-0 ${s.phase === 'underwater' ? 'hidden' : ''}`}/>
+      <div ref={uwEl} className={`absolute inset-0 ${s.phase === 'underwater' ? '' : 'hidden'}`}/>
+
+      {s.phase === 'boot' && <Boot msg={bootMsg}/>}
+
+      {s.phase !== 'boot' && s.phase !== 'diving' && s.phase !== 'ascending' && <TopBar/>}
+
+      {s.phase === 'globe' && <React.Fragment>
+        <SiteExplorer/>
+        {s.site && <SitePanel onDive={() => store.set({ phase:'diving', selection:null })}/>}
+        <div className="absolute bottom-4 right-4 z-10 flex flex-col gap-2 items-end">
+          <button onClick={() => globeRegistry.g?.resetView()} title="Reset view"
+            className="glass w-8 h-8 flex items-center justify-center text-dim hover:text-accent">
+            <Icon name="RotateCcw" size={14}/></button>
+          <CoordReadout/>
+          <span className="font-mono text-[8.5px] text-dim/80 text-right max-w-[220px] leading-relaxed">
+            CesiumJS · Natural Earth II · synthetic Argo / reanalysis demo data</span>
+        </div>
+        <Hint text="DRAG TO ORBIT · SCROLL TO ZOOM · CLICK THE OCEAN TO DROP A POINT"/>
+      </React.Fragment>}
+
+      {s.phase === 'underwater' && s.site && <React.Fragment>
+        <UnderwaterHUD onAscend={ascend}/>
+        {s.selection && <Inspector/>}
+        <Hint cls="bottom-[200px] right-4 hidden sm:block" text="DRAG TO LOOK · SCROLL = DEPTH · CLICK A FLOAT OR THE WATER TO INSPECT"/>
+      </React.Fragment>}
+
+      <Veil show={s.phase === 'diving' || s.phase === 'ascending'} bgOn={veilBg}
+        text={veilText} showSkip={s.phase === 'diving'} onSkip={() => skipRef.current()}/>
+
+      {s.toast &&
+        <div className="absolute bottom-20 left-1/2 -translate-x-1/2 z-40 glass px-3.5 py-2 text-[11px] font-mono text-mist">
+          {s.toast.msg}
+        </div>}
+    </div>
+  );
+};
+
+ReactDOM.createRoot(document.getElementById('root')!).render(<App/>);
+</script>
+</body>
+</html>
