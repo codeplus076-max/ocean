@@ -1,14 +1,9 @@
 /**
  * PELAGOS Ocean 3D Configuration
- *
- * For Production (Vercel):
- * Set API_BASE to your deployed Render backend URL, for example:
- * API_BASE: "https://pelagos-backend.onrender.com/api"
- *
- * For Local Development:
- * Leave as "http://localhost:8000/api" or leave empty for auto-detection.
+ * Production backend deployed on Render: https://pelagos-backend-1eic.onrender.com
  */
 window.__PELAGOS_CONFIG__ = {
-  // Replace with your Render URL after deploying backend (e.g. 'https://your-service.onrender.com/api')
-  API_BASE: "http://localhost:8000/api"
+  API_BASE: (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1")
+    ? "http://localhost:8000/api"
+    : "https://pelagos-backend-1eic.onrender.com/api"
 };
